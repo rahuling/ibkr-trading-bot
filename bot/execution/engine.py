@@ -51,12 +51,20 @@ class ExecutionEngine:
         Return True if current time is in an order blackout window.
 
         Blackout windows (ET):
-          - 9:30–9:45am (opening volatility)
-          - 3:55–4:00pm (closing risk)
+          - Market open + order_blackout_open_mins  (default 9:30–9:45am)
+          - Market close - order_blackout_close_mins (default 3:55–4:00pm)
+
+        Boundaries are read from config so changing config.yaml takes effect
+        without a code change. Previously these were hardcoded to 9:45 and
+        15:55, which silently ignored the config values.
         """
         now = datetime.now(ET).time()
-        open_blackout_end = time(9, 45)
-        close_blackout_start = time(15, 55)
+        # Market open is 9:30 ET; add the configured blackout duration.
+        open_end_total_min = 9 * 60 + 30 + self.config.execution.order_blackout_open_mins
+        open_blackout_end = time(open_end_total_min // 60, open_end_total_min % 60)
+        # Market close is 16:00 ET; subtract the configured blackout duration.
+        close_start_total_min = 16 * 60 - self.config.execution.order_blackout_close_mins
+        close_blackout_start = time(close_start_total_min // 60, close_start_total_min % 60)
         return now < open_blackout_end or now >= close_blackout_start
 
     # ------------------------------------------------------------------

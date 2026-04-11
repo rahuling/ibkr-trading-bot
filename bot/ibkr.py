@@ -40,6 +40,11 @@ class IBKRConnection:
         self._on_alert = on_alert
         self.ib = IB()
         self._reconnect_task: Optional[asyncio.Task] = None
+        # Register the disconnect handler exactly once on the IB object that
+        # persists across reconnects. Never register again inside connect() —
+        # doing so accumulates duplicate handlers, spawning two reconnect loops
+        # on each subsequent disconnect.
+        self.ib.disconnectedEvent += self._on_disconnect
 
     # ------------------------------------------------------------------
     # Connection
@@ -50,7 +55,6 @@ class IBKRConnection:
         logger.info("Connecting to IB Gateway at %s:%s (client_id=%s)",
                     self.host, self.port, self.client_id)
         await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
-        self.ib.disconnectedEvent += self._on_disconnect
         logger.info("Connected to IB Gateway. Account: %s", self.ib.client.accounts)
 
     async def disconnect(self) -> None:
@@ -66,6 +70,11 @@ class IBKRConnection:
 
     def _on_disconnect(self) -> None:
         logger.warning("IB Gateway disconnected — starting reconnect loop")
+        # Cancel any in-flight reconnect loop before starting a new one.
+        # Without this, a second disconnect event while a loop is already
+        # running would orphan the old task and create two competing loops.
+        if self._reconnect_task and not self._reconnect_task.done():
+            self._reconnect_task.cancel()
         self._reconnect_task = asyncio.create_task(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:
@@ -102,7 +111,11 @@ class IBKRConnection:
         """Return current Net Liquidation Value from IBKR account data."""
         for av in self.ib.accountValues():
             if av.tag == "NetLiquidation" and av.currency == "USD":
-                return float(av.value)
+                try:
+                    return float(av.value)
+                except (ValueError, TypeError):
+                    logger.error("Invalid NetLiquidation value from IBKR: %r", av.value)
+                    return None
         return None
 
     def get_account_id(self) -> Optional[str]:
@@ -112,9 +125,16 @@ class IBKRConnection:
 
 def create_ibkr_connection(on_alert=None) -> IBKRConnection:
     """Create an IBKRConnection from environment variables."""
+    try:
+        port = int(os.getenv("IB_GATEWAY_PORT", "4002"))
+        client_id = int(os.getenv("IB_CLIENT_ID", "1"))
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid IB_GATEWAY_PORT or IB_CLIENT_ID in environment: {exc}"
+        ) from exc
     return IBKRConnection(
         host=os.getenv("IB_GATEWAY_HOST", "127.0.0.1"),
-        port=int(os.getenv("IB_GATEWAY_PORT", "4002")),
-        client_id=int(os.getenv("IB_CLIENT_ID", "1")),
+        port=port,
+        client_id=client_id,
         on_alert=on_alert,
     )

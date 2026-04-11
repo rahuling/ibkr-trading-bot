@@ -7,12 +7,72 @@ PRD reference: §5 M3 Telegram Interface — Commands table.
 """
 
 import logging
+import os
+import time as time_module
+from collections import defaultdict
 
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, Application
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+_last_call: dict = defaultdict(float)
+
+# Commands that trigger expensive operations (IBKR API calls, full scans).
+# Keyed by command name → minimum seconds between invocations per user.
+_RATE_LIMITS = {
+    "scan":       30,
+    "reconcile":  60,
+    "positions":  10,
+    "risk":       10,
+}
+
+
+def _check_rate_limit(user_id: int, command: str) -> bool:
+    """
+    Return True if the command is allowed, False if the user is calling
+    too fast.
+
+    Prevents a single allowlisted user from spamming expensive operations.
+    Uses monotonic clock so it is immune to system clock changes.
+    """
+    cooldown = _RATE_LIMITS.get(command, 0)
+    if cooldown == 0:
+        return True
+    key = (user_id, command)
+    now = time_module.monotonic()
+    if now - _last_call[key] < cooldown:
+        return False
+    _last_call[key] = now
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Setconfig allowlist
+# ---------------------------------------------------------------------------
+
+# Only these dot-path config params may be mutated at runtime via /setconfig.
+# All other params require a config.yaml edit + restart.
+# When implementing Phase 4: add range validation per param alongside this set.
+_SETCONFIG_ALLOWED: frozenset = frozenset({
+    "risk.daily_loss_limit_pct",
+    "risk.weekly_loss_limit_pct",
+    "risk.monthly_loss_limit_pct",
+    "risk.min_ivr_core",
+    "risk.min_ivr_tactical",
+    "risk.earnings_blackout_pre_days",
+    "risk.earnings_blackout_post_days",
+    "automation.level",
+})
+
+
+# ---------------------------------------------------------------------------
+# Command registration
+# ---------------------------------------------------------------------------
 
 def register_commands(app: Application, bot, auth_filter) -> None:
     """Register all command handlers with the Telegram application."""
@@ -97,7 +157,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
 
     gw_status = "🟢 Connected" if connected else "🔴 Disconnected"
     balance = f"${net_liq:,.2f}" if net_liq else "N/A"
-    mode = "PAPER" if "paper" in (account or "").lower() else "LIVE"
+
+    # Use the explicit TRADING_MODE env var rather than guessing from the
+    # account ID string — account IDs don't reliably contain "paper".
+    trading_mode = os.getenv("TRADING_MODE", "paper").upper()
+    mode = "PAPER" if trading_mode == "PAPER" else "LIVE"
 
     text = (
         f"📊 *Bot Status*\n"
@@ -117,11 +181,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Trigger manual scan. TODO (Phase 2)."""
+    user_id = update.effective_user.id
+    if not _check_rate_limit(user_id, "scan"):
+        await update.message.reply_text("Please wait before scanning again.")
+        return
     await update.message.reply_text("Manual scan triggered. TODO: Phase 2")
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Show open positions with Greeks. TODO (Phase 4)."""
+    user_id = update.effective_user.id
+    if not _check_rate_limit(user_id, "positions"):
+        await update.message.reply_text("Please wait before refreshing positions.")
+        return
     await update.message.reply_text("/positions: TODO Phase 4")
 
 
@@ -147,6 +219,10 @@ async def cmd_roll(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
 
 async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Show risk dashboard. TODO (Phase 4)."""
+    user_id = update.effective_user.id
+    if not _check_rate_limit(user_id, "risk"):
+        await update.message.reply_text("Please wait before refreshing risk data.")
+        return
     await update.message.reply_text("/risk: TODO Phase 4")
 
 
@@ -184,8 +260,31 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -
 
 
 async def cmd_setconfig(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Adjust a config parameter at runtime. TODO (Phase 4)."""
-    await update.message.reply_text("/setconfig: TODO Phase 4")
+    """
+    Adjust a config parameter at runtime. TODO (Phase 4): persist + apply change.
+
+    Only params in _SETCONFIG_ALLOWED may be mutated. All others require a
+    config.yaml edit and restart. This prevents accidental or malicious mutation
+    of critical structural parameters (bucket allocations, strategy targets).
+    """
+    args = context.args if context.args else []
+    if len(args) != 2:
+        allowed = "\n".join(f"  • {p}" for p in sorted(_SETCONFIG_ALLOWED))
+        await update.message.reply_text(
+            f"Usage: /setconfig <param> <value>\n\nMutable params:\n{allowed}"
+        )
+        return
+
+    param, value = args[0], args[1]
+    if param not in _SETCONFIG_ALLOWED:
+        allowed = "\n".join(f"  • {p}" for p in sorted(_SETCONFIG_ALLOWED))
+        await update.message.reply_text(
+            f"'{param}' is not a mutable parameter.\n\nAllowed:\n{allowed}"
+        )
+        return
+
+    # Phase 4: validate value type/range, apply to live config, write audit log.
+    await update.message.reply_text(f"/setconfig {param} {value}: TODO Phase 4")
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -233,4 +332,8 @@ async def cmd_removeticker(update: Update, context: ContextTypes.DEFAULT_TYPE, b
 
 async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Force state reconciliation. TODO (Phase 4)."""
+    user_id = update.effective_user.id
+    if not _check_rate_limit(user_id, "reconcile"):
+        await update.message.reply_text("Reconciliation already in progress — please wait.")
+        return
     await update.message.reply_text("/reconcile: TODO Phase 4")

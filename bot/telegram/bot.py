@@ -29,7 +29,7 @@ class TelegramBot:
         self.token = token
         self.allowed_user_ids = allowed_user_ids
         self.config = config
-        self.notifications: Notifications = None   # set after wire()
+        self.notifications: Notifications = None
         self._app: Application = None
 
         # Modules wired after construction (avoid circular deps)
@@ -37,14 +37,32 @@ class TelegramBot:
         self.risk_engine = None
         self.position_manager = None
         self.execution_engine = None
+        self.premium_scanner = None
+        self.momentum_scanner = None
 
     def wire(self, ibkr, risk_engine, position_manager, execution_engine) -> None:
-        """Wire module dependencies after all are constructed."""
+        """
+        Wire module dependencies after all are constructed.
+
+        Notifications is NOT initialised here — self._app is not built yet
+        (it's created in run()). Attempting to access self._app.bot here
+        produces a Notifications with bot=None, which silently drops every
+        alert during startup. Notifications is initialised once in run().
+        """
         self.ibkr = ibkr
         self.risk_engine = risk_engine
         self.position_manager = position_manager
         self.execution_engine = execution_engine
-        self.notifications = Notifications(self._app.bot if self._app else None, self.allowed_user_ids)
+
+    def wire_scanners(self, premium_scanner, momentum_scanner) -> None:
+        """
+        Store scanner references so Telegram commands can invoke them on demand.
+
+        Called by build_scheduler() after scanner instances are created,
+        so /scan has a handle to call premium_scanner.run() directly.
+        """
+        self.premium_scanner = premium_scanner
+        self.momentum_scanner = momentum_scanner
 
     async def run(self) -> None:
         """Build the application, register handlers, and run until interrupted."""
@@ -54,7 +72,7 @@ class TelegramBot:
             .build()
         )
 
-        # Re-init notifications with the real bot instance
+        # Notifications created here, after self._app is available.
         self.notifications = Notifications(self._app.bot, self.allowed_user_ids)
 
         # Auth filter — silently ignore non-allowlisted users
@@ -63,7 +81,6 @@ class TelegramBot:
         # Register all command handlers
         register_commands(self._app, self, auth_filter)
 
-        # Unhandled messages: silently ignore
         logger.info("Telegram bot starting. Allowed user IDs: %s", self.allowed_user_ids)
         await self._app.run_polling(drop_pending_updates=True)
 
