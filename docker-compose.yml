@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  ib-gateway:
+    # Pin a specific version — never use :latest in production.
+    # Check https://github.com/gnzsnz/ib-gateway-docker/releases for current stable.
+    image: ghcr.io/gnzsnz/ib-gateway-docker:stable-10.19.1
+    restart: always
+    environment:
+      TWS_USERID: ${IBKR_USERNAME}
+      TWS_PASSWORD: ${IBKR_PASSWORD}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      TWS_SETTINGS_PATH: /home/ibgateway/Jts
+      TWOFA_TIMEOUT_ACTION: restart
+      # Nightly restart outside market hours — gateway requires periodic restart
+      AUTO_RESTART_TIME: "11:59 PM"
+    ports:
+      # CRITICAL: bind to 127.0.0.1 only.
+      # IB Gateway has no authentication — never expose this port to the internet.
+      - "127.0.0.1:4002:4002"
+    volumes:
+      - ./ibc:/home/ibgateway/ibc
+      - ./jts:/home/ibgateway/Jts

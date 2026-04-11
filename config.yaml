@@ -1,0 +1,117 @@
+risk:
+  # Capital bucket allocations — must sum to exactly 1.0
+  core_bucket_pct: 0.55        # Wheel (CSPs + Covered Calls)
+  tactical_bucket_pct: 0.20    # Bull Put Spreads
+  momentum_bucket_pct: 0.10    # EOD LEAP calls
+  reserve_pct: 0.15            # Buffer + assignment capital — never traded
+
+  # Position sizing
+  max_position_pct_of_bucket: 0.33   # max 33% of bucket per single position
+  max_underlying_pct: 0.40           # max 40% of portfolio in one underlying
+
+  # Loss circuit breakers (applied to live portfolio value at runtime)
+  daily_loss_limit_pct: 0.015        # 1.5% daily loss → pause new trades
+  weekly_loss_limit_pct: 0.03        # 3% weekly loss → pause new trades
+  monthly_loss_limit_pct: 0.08       # 8% monthly loss → full stop, require /resume
+
+  # Spread-specific
+  max_spread_loss: 600               # absolute max loss per spread position ($)
+
+  # Scanner filters
+  min_ivr_core: 30
+  min_ivr_tactical: 35
+  earnings_blackout_pre_days: 7
+  earnings_blackout_post_days: 2
+
+  # Order timing blackouts
+  order_blackout_open_mins: 15       # no orders in first 15 min of session
+  order_blackout_close_mins: 5       # no orders in last 5 min of session
+
+  # PDT rule monitoring
+  pdt_warning_threshold: 30000       # alert when portfolio < $30k
+  pdt_stop_threshold: 25000          # block day trading when portfolio < $25k
+
+scanner:
+  top_n_candidates: 5
+  watchlist:
+    core:
+      - SPY
+      - QQQ
+      - IWM
+      - GLD
+      - AAPL
+      - MSFT
+      - NVDA
+      - AMZN
+      - GOOGL
+    tactical:
+      - AMD
+      - META
+      - TSLA
+      - NFLX
+      - CRM
+      - COIN
+      - MSTR
+
+trading:
+  csp:
+    dte_min: 30
+    dte_max: 45
+    target_delta: -0.27
+    delta_tolerance: 0.03
+    profit_close_pct: 0.50       # close at 50% of max credit
+
+  spread:
+    dte_min: 7
+    dte_max: 21
+    target_delta: -0.30
+    delta_tolerance: 0.02
+    spread_width: 5
+    min_credit_to_width_ratio: 0.25
+    profit_close_pct: 0.75       # close at 75% of max credit
+
+  covered_call:
+    dte_min: 7
+    dte_max: 21
+    target_delta: 0.28
+    profit_close_pct: 0.75
+
+execution:
+  order_blackout_open_mins: 15
+  order_blackout_close_mins: 5
+  reprice_wait_minutes: 5
+  reprice_retry_wait_minutes: 3
+  proposal_ttl_minutes: 120      # proposals expire 2 hours after creation (or at 4pm ET)
+
+leap:
+  min_dte: 300
+  max_dte: 420
+  target_delta: 0.78
+  delta_tolerance: 0.05          # acceptable range: 0.73–0.83
+  stop_loss_pct: 0.02            # 2% adverse move in underlying → close LEAP
+  profit_target_pct: 0.08        # 8% favourable move in underlying → close LEAP
+  max_extrinsic_pct: 0.25        # reject if time premium > 25% of option cost
+  eod_entry_window_start: "15:30"
+  eod_entry_window_end: "15:55"
+  momentum_watchlist:
+    - SPY
+    - QQQ
+    - AAPL
+    - NVDA
+    - MSFT
+    - AMD
+    - META
+    - TSLA
+    - AMZN
+    - GOOGL
+    - NFLX
+    - CRM
+  signal:
+    min_volume_ratio: 1.2            # session volume >= 1.2x 20-day average
+    max_pct_from_day_high: 1.0       # price within 1% of intraday high
+    require_above_sma20: true
+    earnings_blackout_days: 5        # tighter than premium-selling
+
+automation:
+  level: 2                           # 1=alerts only, 2=assisted, 3=autonomous
+  l3_large_position_pct: 0.20        # L3: require approval if position > 20% of portfolio

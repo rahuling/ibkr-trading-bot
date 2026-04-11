@@ -1,0 +1,20 @@
+[Unit]
+Description=IBKR Options Trading Bot
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/trading-bot
+ExecStart=/opt/trading-bot/venv/bin/python bot/main.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/opt/trading-bot/.env
+
+# Logging — systemd captures stdout/stderr; view with: journalctl -u trading-bot -f
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

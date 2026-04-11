@@ -1,0 +1,36 @@
+# Secrets — never commit these
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Database — local data only
+data/*.db
+data/*.db-wal
+data/*.db-shm
+backups/
+
+# IB Gateway volumes
+jts/
+ibc/
+
+# Logs
+logs/*.log
+logs/*.log.*
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
