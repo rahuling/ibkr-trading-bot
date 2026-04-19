@@ -300,8 +300,11 @@ async def main() -> None:
     try:
         logger.info("Bot started. Waiting for commands.")
         await telegram_bot.run()
+    except (KeyboardInterrupt, SystemExit):
+        pass
     finally:
         logger.info("Shutting down...")
+        await telegram_bot.stop()
         if scheduler and scheduler.running:
             scheduler.shutdown(wait=False)
         if ibkr:

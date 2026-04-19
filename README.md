@@ -311,7 +311,7 @@ The codebase is structured in build phases. Each module has stubs and `TODO (Pha
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | Infrastructure: config, DB schema, IB Gateway connection, Telegram `/status` | Done |
-| 2 | Premium scanner (M1) + CSP/Spread TradeBuilder (M2) | Not started |
+| 2 | Premium scanner (M1) + CSP/Spread TradeBuilder (M2) | Done |
 | 3 | Execution Engine (M4): order submission, repricing, crash recovery | Not started |
 | 4 | Risk Engine (M6) + Position Manager (M5): live checks, PDT, reconciliation | Not started |
 | 5a | Journal (M7): trade logging, monthly reports, `/analyze` | Not started |
@@ -330,6 +330,7 @@ The codebase is structured in build phases. Each module has stubs and `TODO (Pha
 | `aiosqlite` | Async SQLite |
 | `python-dotenv` | `.env` file loading |
 | `pytz` | Timezone support for APScheduler |
+| `yfinance` | Earnings calendar lookup for blackout checks |
 
 ---
 

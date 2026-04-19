@@ -12,13 +12,23 @@ Reconnect sequence:
 import asyncio
 import logging
 import os
+from datetime import datetime
+from datetime import time as dtime
 from typing import Optional
 
+import pytz
 from ib_async import IB
 
 logger = logging.getLogger(__name__)
 
 _BACKOFF_STEPS = [5, 10, 30, 60]
+_ET = pytz.timezone("America/New_York")
+
+
+def _is_nightly_restart_window() -> bool:
+    """Return True during 11:58pm–12:05am ET — the IB Gateway nightly restart window."""
+    now = datetime.now(_ET).time()
+    return now >= dtime(23, 58) or now <= dtime(0, 5)
 
 
 class IBKRConnection:
@@ -93,9 +103,12 @@ class IBKRConnection:
             except Exception as exc:
                 logger.error("Reconnect attempt %s failed: %s", attempt + 1, exc)
                 if attempt == 0 and self._on_alert:
-                    await self._on_alert(
-                        f"⚠️ IB Gateway disconnected. Attempting reconnect..."
-                    )
+                    if _is_nightly_restart_window():
+                        logger.info("Disconnect during nightly restart window — suppressing Telegram alert")
+                    else:
+                        await self._on_alert(
+                            "⚠️ IB Gateway disconnected. Attempting reconnect..."
+                        )
                 elif attempt >= len(_BACKOFF_STEPS) - 1 and self._on_alert:
                     await self._on_alert(
                         f"🚨 IB Gateway still disconnected after {attempt + 1} attempts."

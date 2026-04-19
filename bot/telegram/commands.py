@@ -8,6 +8,7 @@ PRD reference: §5 M3 Telegram Interface — Commands table.
 
 import logging
 import os
+import re
 import time as time_module
 from collections import defaultdict
 
@@ -15,6 +16,15 @@ from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, Application
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# MarkdownV2 helpers
+# ---------------------------------------------------------------------------
+
+def _e(value) -> str:
+    """Escape a value for use in a MarkdownV2 message body."""
+    return re.sub(r'([_*\[\]()~`>#+=|{}.!\-])', r'\\\1', str(value))
+
 
 # ---------------------------------------------------------------------------
 # Rate limiting
@@ -180,12 +190,31 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
 # ---------------------------------------------------------------------------
 
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Trigger manual scan. TODO (Phase 2)."""
+    """Trigger manual premium-selling scan."""
     user_id = update.effective_user.id
     if not _check_rate_limit(user_id, "scan"):
         await update.message.reply_text("Please wait before scanning again.")
         return
-    await update.message.reply_text("Manual scan triggered. TODO: Phase 2")
+
+    if not bot.premium_scanner:
+        await update.message.reply_text("Scanner not initialized.")
+        return
+
+    await update.message.reply_text("🔍 Running premium-selling scan...")
+    try:
+        candidates = await bot.premium_scanner.run()
+        if not candidates:
+            await update.message.reply_text(
+                "No candidates found. IV may be low across watchlist, or all tickers are"
+                " in earnings blackout / already have open positions."
+            )
+        else:
+            await update.message.reply_text(
+                f"Scan complete — {len(candidates)} proposal(s) sent above."
+            )
+    except Exception as exc:
+        logger.error("cmd_scan failed: %s", exc, exc_info=True)
+        await update.message.reply_text("Scan failed — check logs.")
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -290,6 +319,11 @@ async def cmd_setconfig(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Show current configuration."""
     cfg = bot.config
+    daily  = _e(f"{cfg.risk.daily_loss_limit_pct * 100:.1f}")
+    weekly = _e(f"{cfg.risk.weekly_loss_limit_pct * 100:.1f}")
+    monthly = _e(f"{cfg.risk.monthly_loss_limit_pct * 100:.1f}")
+    delta  = _e(cfg.trading.csp.target_delta)
+    max_loss = _e(f"{cfg.risk.max_spread_loss:g}")
     text = (
         f"*Current Configuration*\n"
         f"Automation: L{cfg.automation.level}\n"
@@ -297,27 +331,22 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
         f"Tactical {cfg.risk.tactical_bucket_pct*100:.0f}% / "
         f"Momentum {cfg.risk.momentum_bucket_pct*100:.0f}% / "
         f"Reserve {cfg.risk.reserve_pct*100:.0f}%\n"
-        f"Daily stop: {cfg.risk.daily_loss_limit_pct*100:.1f}%  "
-        f"Weekly: {cfg.risk.weekly_loss_limit_pct*100:.1f}%  "
-        f"Monthly: {cfg.risk.monthly_loss_limit_pct*100:.1f}%\n"
+        f"Daily stop: {daily}%  Weekly: {weekly}%  Monthly: {monthly}%\n"
         f"IVR min: Core {cfg.risk.min_ivr_core} / Tactical {cfg.risk.min_ivr_tactical}\n"
-        f"CSP delta target: {cfg.trading.csp.target_delta}  "
-        f"DTE: {cfg.trading.csp.dte_min}–{cfg.trading.csp.dte_max}\n"
-        f"Spread width: ${cfg.trading.spread.spread_width}  "
-        f"Max loss: ${cfg.risk.max_spread_loss}\n"
-        f"LEAP stop: {cfg.leap.stop_loss_pct*100:.0f}%  "
-        f"Target: {cfg.leap.profit_target_pct*100:.0f}%\n"
+        f"CSP delta target: {delta}  DTE: {cfg.trading.csp.dte_min}–{cfg.trading.csp.dte_max}\n"
+        f"Spread width: ${cfg.trading.spread.spread_width}  Max loss: ${max_loss}\n"
+        f"LEAP stop: {cfg.leap.stop_loss_pct*100:.0f}%  Target: {cfg.leap.profit_target_pct*100:.0f}%\n"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
 async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Show current watchlist."""
-    core = ", ".join(bot.config.scanner.watchlist.core)
-    tactical = ", ".join(bot.config.scanner.watchlist.tactical)
-    momentum = ", ".join(bot.config.leap.momentum_watchlist)
+    core = _e(", ".join(bot.config.scanner.watchlist.core))
+    tactical = _e(", ".join(bot.config.scanner.watchlist.tactical))
+    momentum = _e(", ".join(bot.config.leap.momentum_watchlist))
     text = f"*Watchlist*\nCore: {core}\nTactical: {tactical}\nMomentum: {momentum}"
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="MarkdownV2")
 
 
 async def cmd_addticker(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:

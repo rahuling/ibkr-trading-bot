@@ -21,8 +21,6 @@ from typing import Optional
 
 import pytz
 
-from ib_async import LimitOrder, MarketOrder
-
 logger = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
@@ -90,16 +88,6 @@ class ExecutionEngine:
             raise RuntimeError("Order blocked — currently in blackout window")
 
         client_order_id = str(uuid.uuid4())
-
-        # Step 2: write BEFORE submitting
-        # await db.execute(
-        #     "INSERT INTO orders (client_order_id, proposal_id, status, expected_price, ...) VALUES ...",
-        #     ...
-        # )
-
-        # Step 3: submit
-        order = LimitOrder("BUY", quantity, price)
-        # trade = await self.ibkr.ib.placeOrderAsync(contract, order)
 
         raise NotImplementedError
 

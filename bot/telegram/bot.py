@@ -7,8 +7,9 @@ All other users are silently ignored — no error response returned.
 PRD reference: §5 M3 Telegram Interface.
 """
 
+import asyncio
 import logging
-from typing import Set
+from typing import Optional, Set
 
 from telegram import Update
 from telegram.ext import (
@@ -31,6 +32,7 @@ class TelegramBot:
         self.config = config
         self.notifications: Notifications = None
         self._app: Application = None
+        self._stop_event: Optional[asyncio.Event] = None
 
         # Modules wired after construction (avoid circular deps)
         self.ibkr = None
@@ -60,12 +62,26 @@ class TelegramBot:
 
         Called by build_scheduler() after scanner instances are created,
         so /scan has a handle to call premium_scanner.run() directly.
+
+        Also wires the on_proposal callback so the scanner can broadcast
+        trade cards without holding a direct reference to TelegramBot.
+        self.send_alert is safe to capture here — it checks self.notifications
+        at call time, not at wiring time.
         """
         self.premium_scanner = premium_scanner
         self.momentum_scanner = momentum_scanner
+        premium_scanner.on_proposal = self.send_alert
 
     async def run(self) -> None:
-        """Build the application, register handlers, and run until interrupted."""
+        """
+        Build the application, register handlers, and run until stop() is called.
+
+        Uses the low-level async API instead of run_polling() because run_polling()
+        is a synchronous method that calls loop.run_until_complete() internally —
+        calling it from within an already-running event loop raises RuntimeError.
+        """
+        self._stop_event = asyncio.Event()
+
         self._app = (
             Application.builder()
             .token(self.token)
@@ -82,7 +98,18 @@ class TelegramBot:
         register_commands(self._app, self, auth_filter)
 
         logger.info("Telegram bot starting. Allowed user IDs: %s", self.allowed_user_ids)
-        await self._app.run_polling(drop_pending_updates=True)
+
+        async with self._app:
+            await self._app.updater.start_polling(drop_pending_updates=True)
+            await self._app.start()
+            await self._stop_event.wait()
+            await self._app.updater.stop()
+            await self._app.stop()
+
+    async def stop(self) -> None:
+        """Signal run() to shut down the Telegram polling loop."""
+        if self._stop_event:
+            self._stop_event.set()
 
     # ------------------------------------------------------------------
     # Alert helpers (called from other modules)
