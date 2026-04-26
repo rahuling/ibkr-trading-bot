@@ -2,7 +2,7 @@ services:
   ib-gateway:
     # Pin a specific version — never use :latest in production.
     # Check https://github.com/gnzsnz/ib-gateway-docker/releases for current stable.
-    image: ghcr.io/gnzsnz/ib-gateway-docker:stable
+    image: ghcr.io/gnzsnz/ib-gateway:stable
     restart: always
     environment:
       TWS_USERID: ${IBKR_USERNAME}
