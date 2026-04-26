@@ -17,4 +17,9 @@ services:
       # IB Gateway has no authentication — never expose this port to the internet.
       - "127.0.0.1:4002:4002"
     volumes:
-      - ./jts:/home/ibgateway/Jts
+      - ib-gateway-jts:/home/ibgateway/Jts
+      - ib-gateway-ibc:/home/ibgateway/ibc
+
+volumes:
+  ib-gateway-jts:
+  ib-gateway-ibc:
