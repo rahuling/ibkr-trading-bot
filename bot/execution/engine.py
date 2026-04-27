@@ -14,18 +14,21 @@ PRD reference: §5 M4 Execution Engine.
 """
 
 import asyncio
+import json
 import logging
+import math
 import uuid
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from typing import Optional
 
 import pytz
+from ib_async import LimitOrder, MarketOrder, Option
 
 logger = logging.getLogger(__name__)
 
 ET = pytz.timezone("America/New_York")
 
-# Tick size depends on option price
+
 def get_tick_size(option_price: float) -> float:
     return 0.05 if option_price < 3.00 else 0.10
 
@@ -39,6 +42,7 @@ class ExecutionEngine:
         self.config = config
         self.ibkr = ibkr
         self.risk = risk_engine
+        self.on_notify = None  # set by TelegramBot.wire() after construction
 
     # ------------------------------------------------------------------
     # Order blackout check
@@ -76,22 +80,215 @@ class ExecutionEngine:
         Flow:
           1. Generate UUID client_order_id
           2. Write to orders table with status 'pending_submit'  ← BEFORE API call
-          3. Submit limit order via ib_async
+          3. Submit limit SELL order via ib_async
           4. Update orders table with ibkr_order_id, status 'submitted'
-          5. Start fill monitoring
+          5. Start fill monitoring as a background task
 
         Returns client_order_id.
-
-        TODO (Phase 3): implement.
         """
         if self.is_in_blackout():
             raise RuntimeError("Order blocked — currently in blackout window")
 
         client_order_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
 
-        raise NotImplementedError
+        # Write to DB BEFORE the API call — guarantees idempotent recovery on crash.
+        await db.execute(
+            """INSERT INTO orders
+               (client_order_id, proposal_id, status, expected_price, created_at, submitted_at)
+               VALUES (?, ?, 'pending_submit', ?, ?, ?)""",
+            (client_order_id, proposal_id, price, now.isoformat(), now.isoformat()),
+        )
+        await db.commit()
 
-    async def reprice_and_retry(self, db, client_order_id: str, original_price: float) -> None:
+        order = LimitOrder("SELL", quantity, price)
+        order.orderRef = client_order_id  # links the IBKR order back to our UUID
+        order.tif = "DAY"
+
+        try:
+            ib_trade = self.ibkr.ib.placeOrder(contract, order)
+        except Exception as exc:
+            await db.execute(
+                "UPDATE orders SET status = 'cancelled' WHERE client_order_id = ?",
+                (client_order_id,),
+            )
+            await db.commit()
+            raise RuntimeError(f"placeOrder failed: {exc}") from exc
+
+        ibkr_order_id = ib_trade.order.orderId
+        await db.execute(
+            "UPDATE orders SET ibkr_order_id = ?, status = 'submitted' WHERE client_order_id = ?",
+            (ibkr_order_id, client_order_id),
+        )
+        await db.commit()
+
+        logger.info(
+            "Order submitted: ref=%s ibkr_id=%s price=%.2f qty=%d proposal=%s",
+            client_order_id, ibkr_order_id, price, quantity, proposal_id,
+        )
+
+        # Fill monitor runs as a fire-and-forget task so the caller returns immediately.
+        asyncio.create_task(
+            self._monitor_fill(ib_trade, client_order_id, contract, price, quantity, proposal_id)
+        )
+
+        return client_order_id
+
+    async def _monitor_fill(
+        self,
+        ib_trade,
+        client_order_id: str,
+        contract,
+        price: float,
+        quantity: int,
+        proposal_id: str,
+    ) -> None:
+        """Poll for fill; trigger reprice_and_retry if still open after reprice_wait_minutes."""
+        from bot.database import get_db
+
+        reprice_wait_secs = self.config.execution.reprice_wait_minutes * 60
+
+        elapsed = 0
+        while elapsed < reprice_wait_secs:
+            await asyncio.sleep(10)
+            elapsed += 10
+            if ib_trade.isDone():
+                break
+
+        async with get_db() as db:
+            if ib_trade.isDone():
+                if ib_trade.orderStatus.status == "Filled":
+                    await self._record_fill(db, client_order_id, ib_trade, proposal_id)
+                else:
+                    await db.execute(
+                        "UPDATE orders SET status = 'cancelled' WHERE client_order_id = ?",
+                        (client_order_id,),
+                    )
+                    await db.commit()
+                    logger.info("Order %s done with status %s", client_order_id, ib_trade.orderStatus.status)
+            else:
+                await self.reprice_and_retry(
+                    db, client_order_id, price, ib_trade, contract, quantity, proposal_id
+                )
+
+    async def _record_fill(self, db, client_order_id: str, ib_trade, proposal_id: str) -> None:
+        """Record a completed fill: create trade row, update order row, notify user."""
+        fill_price = ib_trade.orderStatus.avgFillPrice
+        filled_at = datetime.now(timezone.utc)
+
+        async with db.execute(
+            "SELECT expected_price FROM orders WHERE client_order_id = ?", (client_order_id,)
+        ) as cur:
+            order_row = await cur.fetchone()
+        expected_price = order_row["expected_price"] if order_row else fill_price
+        slippage = fill_price - expected_price
+
+        async with db.execute(
+            "SELECT underlying, strategy, trade_card_json FROM proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ) as cur:
+            prop_row = await cur.fetchone()
+
+        if not prop_row:
+            logger.error("_record_fill: proposal %s not found in DB", proposal_id)
+            return
+
+        underlying = prop_row["underlying"]
+        strategy = prop_row["strategy"]
+        proposal_data = json.loads(prop_row["trade_card_json"])
+
+        if strategy == "CSP":
+            legs = json.dumps([{
+                "strike": proposal_data["strike"],
+                "expiry": proposal_data["expiry"],
+                "right": "P",
+                "qty": 1,
+                "action": "SELL",
+            }])
+            bucket = "Core"
+            entry_delta = proposal_data.get("delta")
+        else:  # BullPutSpread
+            legs = json.dumps([
+                {
+                    "strike": proposal_data["short_strike"],
+                    "expiry": proposal_data["expiry"],
+                    "right": "P",
+                    "qty": 1,
+                    "action": "SELL",
+                    "con_id": proposal_data["short_put_con_id"],
+                },
+                {
+                    "strike": proposal_data["long_strike"],
+                    "expiry": proposal_data["expiry"],
+                    "right": "P",
+                    "qty": 1,
+                    "action": "BUY",
+                    "con_id": proposal_data["long_put_con_id"],
+                },
+            ])
+            bucket = "Tactical"
+            entry_delta = proposal_data.get("short_delta")
+
+        entry_config = json.dumps({
+            "daily_loss_limit_pct": self.config.risk.daily_loss_limit_pct,
+            "max_position_pct_of_bucket": self.config.risk.max_position_pct_of_bucket,
+            "automation_level": self.config.automation.level,
+        })
+
+        trade_id = str(uuid.uuid4())
+        await db.execute(
+            """INSERT INTO trades
+               (trade_id, underlying, strategy, bucket, legs,
+                entry_date, entry_credit, entry_ivr, entry_delta, entry_dte,
+                entry_underlying_price, entry_config, rule_tags, entry_signals, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')""",
+            (
+                trade_id, underlying, strategy, bucket, legs,
+                filled_at.isoformat(),
+                fill_price,
+                proposal_data.get("ivr"),
+                entry_delta,
+                proposal_data.get("dte"),
+                proposal_data.get("underlying_price"),
+                entry_config,
+                json.dumps(proposal_data.get("rule_tags", [])),
+                json.dumps(proposal_data.get("entry_signals", {})),
+            ),
+        )
+        await db.execute(
+            """UPDATE orders
+               SET status = 'filled', fill_price = ?, slippage = ?, filled_at = ?, trade_id = ?
+               WHERE client_order_id = ?""",
+            (fill_price, slippage, filled_at.isoformat(), trade_id, client_order_id),
+        )
+        await db.commit()
+
+        logger.info(
+            "Fill recorded: trade=%s %s %s fill=%.2f slippage=%+.2f",
+            trade_id, underlying, strategy, fill_price, slippage,
+        )
+
+        if self.on_notify:
+            await self.on_notify(
+                f"✅ FILLED: {underlying} {strategy}\n"
+                f"Fill: ${fill_price:.2f}  |  Expected: ${expected_price:.2f}  |  "
+                f"Slippage: ${slippage:+.2f}"
+            )
+
+    # ------------------------------------------------------------------
+    # Reprice
+    # ------------------------------------------------------------------
+
+    async def reprice_and_retry(
+        self,
+        db,
+        client_order_id: str,
+        original_price: float,
+        ib_trade=None,
+        contract=None,
+        quantity: int = 1,
+        proposal_id: str = None,
+    ) -> None:
         """
         After reprice_wait_minutes without a fill:
           1. Cancel the current order
@@ -101,10 +298,97 @@ class ExecutionEngine:
         Tick size: $0.05 for options < $3, $0.10 for options >= $3.
 
         If still unfilled after reprice_retry_wait_minutes: cancel and notify user.
-
-        TODO (Phase 3): implement.
         """
-        raise NotImplementedError
+        # Cancel the live order and wait for IBKR to confirm.
+        if ib_trade and not ib_trade.isDone():
+            self.ibkr.ib.cancelOrder(ib_trade.order)
+            for _ in range(30):
+                if ib_trade.isDone():
+                    break
+                await asyncio.sleep(1)
+
+        tick = get_tick_size(original_price)
+        new_price = round(original_price + tick, 2)
+
+        logger.info(
+            "Repricing %s: %.2f → %.2f (tick=%.2f)",
+            client_order_id, original_price, new_price, tick,
+        )
+
+        await db.execute(
+            "UPDATE orders SET status = 'repriced' WHERE client_order_id = ?",
+            (client_order_id,),
+        )
+        await db.commit()
+
+        new_client_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc)
+
+        await db.execute(
+            """INSERT INTO orders
+               (client_order_id, proposal_id, status, expected_price, created_at, submitted_at)
+               VALUES (?, ?, 'pending_submit', ?, ?, ?)""",
+            (new_client_id, proposal_id, new_price, now.isoformat(), now.isoformat()),
+        )
+        await db.commit()
+
+        new_order = LimitOrder("SELL", quantity, new_price)
+        new_order.orderRef = new_client_id
+        new_order.tif = "DAY"
+
+        try:
+            new_ib_trade = self.ibkr.ib.placeOrder(contract, new_order)
+        except Exception as exc:
+            logger.error("reprice placeOrder failed: %s", exc)
+            await db.execute(
+                "UPDATE orders SET status = 'cancelled' WHERE client_order_id = ?",
+                (new_client_id,),
+            )
+            await db.commit()
+            if self.on_notify:
+                await self.on_notify(
+                    f"⚠️ Reprice order submission failed: {exc}\n"
+                    f"Original ref: {client_order_id[:8]}..."
+                )
+            return
+
+        await db.execute(
+            "UPDATE orders SET ibkr_order_id = ?, status = 'submitted' WHERE client_order_id = ?",
+            (new_ib_trade.order.orderId, new_client_id),
+        )
+        await db.commit()
+
+        logger.info("Repriced order submitted: %s at %.2f", new_client_id, new_price)
+
+        retry_wait_secs = self.config.execution.reprice_retry_wait_minutes * 60
+        elapsed = 0
+        while elapsed < retry_wait_secs:
+            await asyncio.sleep(10)
+            elapsed += 10
+            if new_ib_trade.isDone():
+                break
+
+        if new_ib_trade.isDone() and new_ib_trade.orderStatus.status == "Filled":
+            await self._record_fill(db, new_client_id, new_ib_trade, proposal_id)
+        else:
+            if not new_ib_trade.isDone():
+                self.ibkr.ib.cancelOrder(new_ib_trade.order)
+            await db.execute(
+                "UPDATE orders SET status = 'cancelled' WHERE client_order_id = ?",
+                (new_client_id,),
+            )
+            await db.commit()
+            logger.info("Order still unfilled after reprice — cancelled: %s", new_client_id)
+            if self.on_notify:
+                await self.on_notify(
+                    f"⚠️ Order unfilled after reprice — cancelled.\n"
+                    f"Ref: {client_order_id[:8]}...\n"
+                    f"Run /scan for fresh proposals."
+                )
+
+    # ------------------------------------------------------------------
+    # Close position
+    # ------------------------------------------------------------------
 
     async def close_position(
         self,
@@ -117,16 +401,134 @@ class ExecutionEngine:
 
         order_type:
           "limit"  — mid price, reprice if needed (default)
-          "bid"    — sell at bid (used for stop-loss urgency)
+          "bid"    — 1 tick above mid (urgent, stop-loss)
           "market" — emergency only, explicit Telegram warning sent first
-
-        TODO (Phase 3): implement.
         """
-        if order_type == "market":
-            logger.warning("MARKET ORDER for emergency close: %s (%s)", position, reason)
-            # send Telegram warning before submitting
+        underlying = position["underlying"]
+        strategy = position["strategy"]
+        legs = json.loads(position["legs"]) if isinstance(position["legs"], str) else position["legs"]
 
-        raise NotImplementedError
+        if order_type == "market":
+            logger.warning(
+                "MARKET ORDER for emergency close: %s %s reason=%s",
+                underlying, strategy, reason,
+            )
+            if self.on_notify:
+                await self.on_notify(
+                    f"⚠️ EMERGENCY MARKET CLOSE: {underlying} {strategy}\nReason: {reason}"
+                )
+
+        contract = await self._reconstruct_contract(strategy, underlying, legs)
+
+        if order_type == "market":
+            order = MarketOrder("BUY", 1)
+            order.tif = "DAY"
+        else:
+            mid = await self._get_current_mid(contract)
+            if mid is None:
+                raise RuntimeError(
+                    f"Cannot get market data for {underlying} {strategy} — try again"
+                )
+
+            if order_type == "bid":
+                # 1 tick above mid gives urgency without going full market
+                tick = get_tick_size(mid)
+                price = round(mid + tick, 2)
+            else:
+                price = round(mid, 2)
+
+            order = LimitOrder("BUY", 1, price)
+            order.tif = "DAY"
+
+        ib_trade = self.ibkr.ib.placeOrder(contract, order)
+        logger.info(
+            "Close order submitted: %s %s type=%s reason=%s", underlying, strategy, order_type, reason
+        )
+
+        asyncio.create_task(self._monitor_close_fill(ib_trade, position, reason))
+
+    async def _reconstruct_contract(self, strategy: str, underlying: str, legs: list):
+        """Rebuild an IBKR contract from stored leg data (for close orders)."""
+        if strategy in ("CSP", "CoveredCall"):
+            leg = legs[0]
+            expiry = leg["expiry"].replace("-", "")
+            contract = Option(underlying, expiry, leg["strike"], leg["right"], "SMART")
+            [qualified] = await self.ibkr.ib.qualifyContractsAsync(contract)
+            return qualified
+
+        if strategy == "BullPutSpread":
+            from bot.builder.spread import build_bag_contract
+            short_leg = next(l for l in legs if l["action"] == "SELL")
+            long_leg = next(l for l in legs if l["action"] == "BUY")
+            return build_bag_contract(
+                self.ibkr, underlying, short_leg["con_id"], long_leg["con_id"]
+            )
+
+        raise ValueError(f"_reconstruct_contract: unsupported strategy '{strategy}'")
+
+    async def _get_current_mid(self, contract) -> Optional[float]:
+        """Request a brief market data stream and return the bid-ask mid."""
+        td = self.ibkr.ib.reqMktData(contract, genericTickList="", snapshot=False)
+        await asyncio.sleep(3)
+        self.ibkr.ib.cancelMktData(contract)
+
+        bid = td.bid if td.bid and not math.isnan(td.bid) and td.bid > 0 else None
+        ask = td.ask if td.ask and not math.isnan(td.ask) and td.ask > 0 else None
+
+        if bid is None or ask is None:
+            return None
+        return (bid + ask) / 2
+
+    async def _monitor_close_fill(self, ib_trade, position, reason: str) -> None:
+        """Wait for a close order to fill, then update DB and notify."""
+        from bot.database import get_db
+
+        wait_secs = self.config.execution.reprice_wait_minutes * 60
+        elapsed = 0
+        while elapsed < wait_secs:
+            await asyncio.sleep(10)
+            elapsed += 10
+            if ib_trade.isDone():
+                break
+
+        underlying = position.get("underlying", "?")
+        strategy = position.get("strategy", "?")
+        trade_id = position.get("trade_id")
+        entry_credit = position.get("entry_credit")
+
+        if ib_trade.isDone() and ib_trade.orderStatus.status == "Filled":
+            fill_price = ib_trade.orderStatus.avgFillPrice
+            pnl = round((entry_credit - fill_price) * 100, 2) if entry_credit else None
+
+            async with get_db() as db:
+                await db.execute(
+                    """UPDATE trades
+                       SET status = 'closed', exit_date = ?, exit_price = ?,
+                           exit_reason = ?, pnl = ?
+                       WHERE trade_id = ?""",
+                    (datetime.now(timezone.utc).isoformat(), fill_price, reason, pnl, trade_id),
+                )
+                await db.commit()
+
+            logger.info(
+                "Close fill recorded: trade=%s fill=%.2f pnl=%s reason=%s",
+                trade_id, fill_price, pnl, reason,
+            )
+            if self.on_notify:
+                pnl_str = f"  |  P&L: ${pnl:+.0f}" if pnl is not None else ""
+                await self.on_notify(
+                    f"✅ CLOSED: {underlying} {strategy}\n"
+                    f"Fill: ${fill_price:.2f}  |  Reason: {reason}{pnl_str}"
+                )
+        else:
+            if not ib_trade.isDone():
+                self.ibkr.ib.cancelOrder(ib_trade.order)
+            logger.warning("Close order unfilled for trade=%s — cancelled", trade_id)
+            if self.on_notify:
+                await self.on_notify(
+                    f"⚠️ Close order unfilled for {underlying} {strategy} — cancelled.\n"
+                    f"Use /close to retry or close manually in TWS."
+                )
 
     # ------------------------------------------------------------------
     # Orphan recovery (called on startup reconciliation)
@@ -138,11 +540,51 @@ class ExecutionEngine:
         actually received them. Called on every startup.
 
         For each orphaned order:
-          - If IBKR has it: update DB to 'submitted' or 'filled'
+          - If IBKR has it: update DB to 'submitted'
           - If IBKR has no record: mark as 'cancelled' in DB, send alert
 
         PRD §13 Failure Modes — Crash Mid-Order.
-
-        TODO (Phase 3): implement.
         """
-        raise NotImplementedError
+        async with db.execute(
+            "SELECT client_order_id, ibkr_order_id FROM orders WHERE status = 'pending_submit'"
+        ) as cur:
+            rows = await cur.fetchall()
+
+        if not rows:
+            logger.info("recover_orphaned_orders: no pending_submit orders")
+            return
+
+        logger.info("recover_orphaned_orders: checking %d orphaned order(s)", len(rows))
+
+        # reqAllOpenOrdersAsync returns orders across all client IDs, not just ours.
+        open_trades = await self.ibkr.ib.reqAllOpenOrdersAsync()
+        ibkr_by_ref = {t.order.orderRef: t for t in open_trades if t.order.orderRef}
+        ibkr_by_id = {t.order.orderId: t for t in open_trades}
+
+        for row in rows:
+            client_order_id = row["client_order_id"]
+            ibkr_order_id = row["ibkr_order_id"]
+
+            found = (client_order_id in ibkr_by_ref) or (
+                ibkr_order_id is not None and ibkr_order_id in ibkr_by_id
+            )
+
+            if found:
+                await db.execute(
+                    "UPDATE orders SET status = 'submitted' WHERE client_order_id = ?",
+                    (client_order_id,),
+                )
+                logger.info("Recovered orphan %s — found in IBKR", client_order_id)
+            else:
+                await db.execute(
+                    "UPDATE orders SET status = 'cancelled' WHERE client_order_id = ?",
+                    (client_order_id,),
+                )
+                logger.warning("Orphan %s not in IBKR — marked cancelled", client_order_id)
+                if self.on_notify:
+                    await self.on_notify(
+                        f"⚠️ Orphaned order {client_order_id[:8]}... not found in IBKR — marked cancelled.\n"
+                        "Verify open positions with /positions."
+                    )
+
+        await db.commit()

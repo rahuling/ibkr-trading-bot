@@ -50,11 +50,16 @@ class TelegramBot:
         (it's created in run()). Attempting to access self._app.bot here
         produces a Notifications with bot=None, which silently drops every
         alert during startup. Notifications is initialised once in run().
+
+        execution_engine.on_notify is set to self.send_alert, which checks
+        self.notifications at call time, so it is safe to assign here even
+        though notifications is not yet initialised.
         """
         self.ibkr = ibkr
         self.risk_engine = risk_engine
         self.position_manager = position_manager
         self.execution_engine = execution_engine
+        execution_engine.on_notify = self.send_alert
 
     def wire_scanners(self, premium_scanner, momentum_scanner) -> None:
         """

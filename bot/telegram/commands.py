@@ -6,14 +6,18 @@ All /command implementations. Registered with the Application in bot.py.
 PRD reference: §5 M3 Telegram Interface — Commands table.
 """
 
+import json
 import logging
 import os
 import re
 import time as time_module
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes, Application
+
+from bot.database import get_db
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,41 @@ _SETCONFIG_ALLOWED: frozenset = frozenset({
     "risk.earnings_blackout_post_days",
     "automation.level",
 })
+
+
+# ---------------------------------------------------------------------------
+# Contract reconstruction helper (used by /approve)
+# ---------------------------------------------------------------------------
+
+async def _build_contract_for_approval(bot, strategy: str, proposal_data: dict):
+    """
+    Reconstruct an IBKR contract and determine the opening limit price
+    from a stored proposal JSON.
+
+    CSP: re-qualifies the option (verifies it is still listed).
+    Spread: builds a BAG using stored con_ids (permanent IBKR identifiers).
+    Returns (contract, price).
+    """
+    if strategy == "CSP":
+        from ib_async import Option
+        expiry_str = proposal_data["expiry"].replace("-", "")  # "20260516"
+        contract = Option(
+            proposal_data["underlying"], expiry_str, proposal_data["strike"], "P", "SMART"
+        )
+        [qualified] = await bot.ibkr.ib.qualifyContractsAsync(contract)
+        return qualified, proposal_data["credit_per_share"]
+
+    if strategy == "BullPutSpread":
+        from bot.builder.spread import build_bag_contract
+        contract = build_bag_contract(
+            bot.ibkr,
+            proposal_data["underlying"],
+            proposal_data["short_put_con_id"],
+            proposal_data["long_put_con_id"],
+        )
+        return contract, proposal_data["credit_per_share"]
+
+    raise ValueError(f"Unknown strategy: {strategy}")
 
 
 # ---------------------------------------------------------------------------
@@ -233,18 +272,180 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
 
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Approve and execute a trade proposal. TODO (Phase 3)."""
-    await update.message.reply_text("/approve: TODO Phase 3")
+    """Approve a pending trade proposal and submit the order to IBKR."""
+    args = context.args if context.args else []
+    if not args:
+        await update.message.reply_text("Usage: /approve <proposal_id>")
+        return
+
+    proposal_id = args[0].upper()
+
+    if not bot.execution_engine:
+        await update.message.reply_text("Execution engine not ready.")
+        return
+
+    if bot.risk_engine and bot.risk_engine.is_paused:
+        await update.message.reply_text("Bot is paused — use /resume before approving trades.")
+        return
+
+    if bot.execution_engine.is_in_blackout():
+        await update.message.reply_text(
+            "❌ Order blocked — market open/close blackout window active.\n"
+            "Try again after the blackout clears."
+        )
+        return
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT * FROM proposals WHERE proposal_id = ?", (proposal_id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await update.message.reply_text(f"Proposal {proposal_id} not found.")
+            return
+
+        proposal = dict(row)
+
+        if proposal["status"] != "pending":
+            await update.message.reply_text(
+                f"Proposal {proposal_id} is already {proposal['status']} — cannot approve."
+            )
+            return
+
+        expires_at = datetime.fromisoformat(proposal["expires_at"])
+        if datetime.now(timezone.utc) > expires_at:
+            await db.execute(
+                "UPDATE proposals SET status = 'expired' WHERE proposal_id = ?", (proposal_id,)
+            )
+            await db.commit()
+            await update.message.reply_text(
+                f"Proposal {proposal_id} has expired. Run /scan for fresh proposals."
+            )
+            return
+
+        strategy = proposal["strategy"]
+        underlying = proposal["underlying"]
+        proposal_data = json.loads(proposal["trade_card_json"])
+
+        try:
+            contract, price = await _build_contract_for_approval(bot, strategy, proposal_data)
+        except Exception as exc:
+            logger.error("Contract reconstruction failed for %s: %s", proposal_id, exc)
+            await update.message.reply_text(f"❌ Failed to reconstruct contract: {exc}")
+            return
+
+        await update.message.reply_text(
+            f"⏳ Submitting {underlying} {strategy} at ${price:.2f}..."
+        )
+
+        try:
+            client_order_id = await bot.execution_engine.submit_order(
+                db, contract, price, quantity=1, proposal_id=proposal_id
+            )
+        except RuntimeError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        except Exception as exc:
+            logger.error("submit_order failed for %s: %s", proposal_id, exc, exc_info=True)
+            await update.message.reply_text("Order submission failed — check logs.")
+            return
+
+        await db.execute(
+            "UPDATE proposals SET status = 'approved', actioned_at = ? WHERE proposal_id = ?",
+            (datetime.now(timezone.utc).isoformat(), proposal_id),
+        )
+        await db.commit()
+
+    await update.message.reply_text(
+        f"✅ Order submitted: {underlying} {strategy}\n"
+        f"Ref: {client_order_id[:8]}...  |  Limit: ${price:.2f}\n"
+        f"You'll be notified on fill."
+    )
 
 
 async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Reject a trade proposal. TODO (Phase 3)."""
-    await update.message.reply_text("/reject: TODO Phase 3")
+    """Reject a pending trade proposal."""
+    args = context.args if context.args else []
+    if not args:
+        await update.message.reply_text("Usage: /reject <proposal_id> [reason]")
+        return
+
+    proposal_id = args[0].upper()
+    reason = " ".join(args[1:]) if len(args) > 1 else "manual"
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT status, underlying, strategy FROM proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ) as cur:
+            row = await cur.fetchone()
+
+        if not row:
+            await update.message.reply_text(f"Proposal {proposal_id} not found.")
+            return
+
+        if row["status"] != "pending":
+            await update.message.reply_text(
+                f"Proposal {proposal_id} is already {row['status']}."
+            )
+            return
+
+        await db.execute(
+            "UPDATE proposals SET status = 'rejected', actioned_at = ? WHERE proposal_id = ?",
+            (datetime.now(timezone.utc).isoformat(), proposal_id),
+        )
+        await db.commit()
+
+    await update.message.reply_text(
+        f"❌ Rejected {proposal_id} ({row['underlying']} {row['strategy']}) — {reason}"
+    )
 
 
 async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Manually close a position. TODO (Phase 3)."""
-    await update.message.reply_text("/close: TODO Phase 3")
+    """Manually close an open position by trade ID."""
+    args = context.args if context.args else []
+    if not args:
+        await update.message.reply_text(
+            "Usage: /close <trade_id>\n\nUse /positions to see trade IDs."
+        )
+        return
+
+    trade_id = args[0]
+    order_type = args[1] if len(args) > 1 else "limit"
+    if order_type not in ("limit", "bid", "market"):
+        await update.message.reply_text("order_type must be: limit, bid, or market")
+        return
+
+    if not bot.execution_engine:
+        await update.message.reply_text("Execution engine not ready.")
+        return
+
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT * FROM trades WHERE trade_id = ? AND status = 'open'", (trade_id,)
+        ) as cur:
+            row = await cur.fetchone()
+
+    if not row:
+        await update.message.reply_text(f"No open trade found with ID {trade_id}.")
+        return
+
+    trade = dict(row)
+
+    await update.message.reply_text(
+        f"⏳ Closing {trade['underlying']} {trade['strategy']} ({order_type})..."
+    )
+
+    try:
+        await bot.execution_engine.close_position(trade, order_type=order_type, reason="manual")
+        await update.message.reply_text(
+            f"Close order submitted for {trade['underlying']} {trade['strategy']}.\n"
+            "You'll be notified on fill."
+        )
+    except Exception as exc:
+        logger.error("close_position failed for trade %s: %s", trade_id, exc, exc_info=True)
+        await update.message.reply_text(f"❌ Close failed: {exc}")
 
 
 async def cmd_roll(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
