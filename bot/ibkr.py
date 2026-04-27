@@ -65,7 +65,7 @@ class IBKRConnection:
         logger.info("Connecting to IB Gateway at %s:%s (client_id=%s)",
                     self.host, self.port, self.client_id)
         await self.ib.connectAsync(self.host, self.port, clientId=self.client_id)
-        logger.info("Connected to IB Gateway. Account: %s", self.ib.client.accounts)
+        logger.info("Connected to IB Gateway. Account: %s", self.ib.managedAccounts())
 
     async def disconnect(self) -> None:
         self.ib.disconnect()

@@ -12,6 +12,7 @@ services:
       TWOFA_TIMEOUT_ACTION: restart
       # Nightly restart outside market hours — gateway requires periodic restart
       AUTO_RESTART_TIME: "11:59 PM"
+      READ_ONLY_API: "no"
     ports:
       # CRITICAL: bind to 127.0.0.1 only.
       # IB Gateway has no authentication — never expose this port to the internet.
