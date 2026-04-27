@@ -81,6 +81,7 @@ bot/
 | 3:00pm | Afternoon premium-selling scan |
 | 3:30pm | EOD momentum scan |
 | 4:15pm | IV history update (after market close) |
+| Every 5 min | Position monitor — updates P&L/Greeks in DB, fires profit-target alerts |
 | Every 5 min | Heartbeat — alerts on 2 consecutive misses |
 | 1st of month, 8am | Monthly P&L report |
 
@@ -312,8 +313,8 @@ The codebase is structured in build phases. Each module has stubs and `TODO (Pha
 |-------|-------|--------|
 | 1 | Infrastructure: config, DB schema, IB Gateway connection, Telegram `/status` | Done |
 | 2 | Premium scanner (M1) + CSP/Spread TradeBuilder (M2) | Done |
-| 3 | Execution Engine (M4): order submission, repricing, crash recovery | Not started |
-| 4 | Risk Engine (M6) + Position Manager (M5): live checks, PDT, reconciliation | Not started |
+| 3 | Execution Engine (M4): order submission, repricing, crash recovery | Done |
+| 4 | Risk Engine (M6) + Position Manager (M5): live checks, PDT, reconciliation | Done |
 | 5a | Journal (M7): trade logging, monthly reports, `/analyze` | Not started |
 | 5b | EOD Momentum scanner + LEAP builder | Not started |
 
