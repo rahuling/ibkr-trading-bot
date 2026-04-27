@@ -100,7 +100,7 @@ class PremiumScanner:
         from ib_async import Stock
 
         candidates = []
-        async with await get_db() as db:
+        async with get_db() as db:
             for ticker in tickers:
                 try:
                     if not await self._is_eligible(ticker, bucket, db):
@@ -208,7 +208,7 @@ class PremiumScanner:
         from bot.builder.csp import build_csp_proposal, format_csp_trade_card
         from bot.builder.spread import build_spread_proposal, format_spread_trade_card
 
-        async with await get_db() as db:
+        async with get_db() as db:
             for candidate in candidates:
                 try:
                     if candidate.strategy == "CSP":

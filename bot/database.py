@@ -10,6 +10,7 @@ the schema has been deployed to a live account.
 
 import aiosqlite
 import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -174,17 +175,16 @@ async def init_db(db_path: Path = DB_PATH) -> None:
     logger.info("Database initialised: %s", db_path)
 
 
-async def get_db(db_path: Path = DB_PATH) -> aiosqlite.Connection:
+@asynccontextmanager
+async def get_db(db_path: Path = DB_PATH):
     """
-    Open a database connection with WAL mode and foreign keys enabled.
+    Async context manager for a database connection with WAL mode and foreign keys.
 
-    Caller is responsible for closing. Prefer using as a context manager:
-
-        async with await get_db() as db:
+        async with get_db() as db:
             ...
     """
-    conn = await aiosqlite.connect(db_path)
-    conn.row_factory = aiosqlite.Row
-    await conn.execute("PRAGMA journal_mode = WAL")
-    await conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    async with aiosqlite.connect(db_path) as conn:
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode = WAL")
+        await conn.execute("PRAGMA foreign_keys = ON")
+        yield conn

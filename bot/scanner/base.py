@@ -132,7 +132,7 @@ async def update_iv_history(config, ibkr) -> None:
     ))
     today_str = date.today().isoformat()
 
-    async with await get_db() as db:
+    async with get_db() as db:
         for ticker in tickers:
             try:
                 async with db.execute(
@@ -187,7 +187,7 @@ async def bootstrap_iv_history(config, ibkr) -> None:
         + config.leap.momentum_watchlist
     ))
 
-    async with await get_db() as db:
+    async with get_db() as db:
         for ticker in tickers:
             try:
                 stock = Stock(ticker, "SMART", "USD")
