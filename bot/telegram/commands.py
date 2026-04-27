@@ -163,10 +163,16 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
     """
     connected = bot.ibkr.is_connected if bot.ibkr else False
     net_liq = bot.ibkr.get_net_liquidation() if bot.ibkr and connected else None
+    net_liq_currency = bot.ibkr.get_net_liquidation_currency() if bot.ibkr and connected else None
     account = bot.ibkr.get_account_id() if bot.ibkr and connected else None
 
     gw_status = "🟢 Connected" if connected else "🔴 Disconnected"
-    balance = f"${net_liq:,.2f}" if net_liq else "N/A"
+    if net_liq:
+        symbol = "$" if net_liq_currency in ("USD", None) else ""
+        suffix = f" {net_liq_currency}" if net_liq_currency and net_liq_currency != "USD" else ""
+        balance = f"{symbol}{net_liq:,.2f}{suffix}"
+    else:
+        balance = "N/A"
 
     # Use the explicit TRADING_MODE env var rather than guessing from the
     # account ID string — account IDs don't reliably contain "paper".

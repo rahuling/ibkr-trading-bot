@@ -122,13 +122,34 @@ class IBKRConnection:
 
     def get_net_liquidation(self) -> Optional[float]:
         """Return current Net Liquidation Value from IBKR account data."""
-        for av in self.ib.accountValues():
-            if av.tag == "NetLiquidation" and av.currency == "USD":
+        values = self.ib.accountValues()
+        for currency in ("USD", "BASE", ""):
+            for av in values:
+                if av.tag == "NetLiquidation" and av.currency == currency:
+                    try:
+                        return float(av.value)
+                    except (ValueError, TypeError):
+                        logger.error("Invalid NetLiquidation value from IBKR: %r", av.value)
+                        return None
+        # Last resort: return first NetLiquidation regardless of currency
+        for av in values:
+            if av.tag == "NetLiquidation":
                 try:
                     return float(av.value)
                 except (ValueError, TypeError):
-                    logger.error("Invalid NetLiquidation value from IBKR: %r", av.value)
                     return None
+        return None
+
+    def get_net_liquidation_currency(self) -> Optional[str]:
+        """Return the currency of the NetLiquidation value."""
+        values = self.ib.accountValues()
+        for currency in ("USD", "BASE", ""):
+            for av in values:
+                if av.tag == "NetLiquidation" and av.currency == currency:
+                    return av.currency
+        for av in values:
+            if av.tag == "NetLiquidation":
+                return av.currency
         return None
 
     def get_account_id(self) -> Optional[str]:
