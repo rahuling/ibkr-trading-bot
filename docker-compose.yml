@@ -15,7 +15,7 @@ services:
     ports:
       # CRITICAL: bind to 127.0.0.1 only.
       # IB Gateway has no authentication — never expose this port to the internet.
-      - "127.0.0.1:4002:4000"
+      - "127.0.0.1:4002:4004"
     volumes:
       - ib-gateway-jts:/home/ibgateway/Jts
       - ib-gateway-ibc:/home/ibgateway/ibc
