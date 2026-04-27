@@ -167,10 +167,10 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
     account = bot.ibkr.get_account_id() if bot.ibkr and connected else None
 
     gw_status = "🟢 Connected" if connected else "🔴 Disconnected"
-    if net_liq:
+    if net_liq is not None:
         symbol = "$" if net_liq_currency in ("USD", None) else ""
         suffix = f" {net_liq_currency}" if net_liq_currency and net_liq_currency != "USD" else ""
-        balance = f"{symbol}{net_liq:,.2f}{suffix}"
+        balance = _e(f"{symbol}{net_liq:,.2f}{suffix}")
     else:
         balance = "N/A"
 
