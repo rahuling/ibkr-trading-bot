@@ -105,6 +105,7 @@ def build_scheduler(
     ibkr: IBKRConnection,
     telegram_bot,
     heartbeat_monitor: HeartbeatMonitor,
+    position_manager=None,
 ) -> AsyncIOScheduler:
     """
     Register all scheduled jobs.
@@ -156,6 +157,15 @@ def build_scheduler(
         id="iv_history_update",
     )
 
+    # Position monitor fallback — every 5 minutes
+    # Updates P&L / Greeks in positions table and fires management alerts.
+    if position_manager:
+        scheduler.add_job(
+            _guarded_job(position_manager.check_all_positions, "position_monitor"),
+            "interval", minutes=5,
+            id="position_monitor",
+        )
+
     # Heartbeat — every 5 minutes
     scheduler.add_job(
         heartbeat_monitor.tick,
@@ -187,18 +197,57 @@ def build_scheduler(
 # Startup reconciliation
 # ---------------------------------------------------------------------------
 
-async def reconcile_state(ibkr: IBKRConnection, telegram_bot) -> bool:
+async def reconcile_state(
+    ibkr: IBKRConnection,
+    telegram_bot,
+    execution_engine=None,
+) -> bool:
     """
     Compare DB open positions against live IBKR positions.
 
     Returns True if state is consistent, False if mismatches found.
-    On mismatch: alerts user and blocks new trade proposals until resolved.
-
-    TODO (Phase 4): implement full reconciliation logic.
+    On mismatch: alerts user but does NOT block — the user should resolve
+    via /reconcile or manual TWS action.
     """
+    from bot.database import get_db
+
     logger.info("Running startup state reconciliation...")
-    # Placeholder — will be implemented in Phase 4
-    logger.info("Reconciliation: OK (placeholder — implement in Phase 4)")
+
+    # 1. Recover orphaned orders (crash-mid-order recovery)
+    if execution_engine:
+        async with get_db() as db:
+            await execution_engine.recover_orphaned_orders(db)
+
+    # 2. Compare DB open trades vs IBKR live option positions
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT underlying FROM trades WHERE status = 'open'"
+        ) as cur:
+            rows = await cur.fetchall()
+    db_underlyings = {row["underlying"] for row in rows}
+
+    try:
+        ibkr_positions = ibkr.ib.positions()
+        ibkr_underlyings = {
+            p.contract.symbol
+            for p in ibkr_positions
+            if p.contract.secType in ("OPT", "BAG")
+        }
+    except Exception as exc:
+        logger.error("IBKR position query during reconcile failed: %s", exc)
+        return True  # Don't block on IBKR query failure
+
+    mismatches = (db_underlyings - ibkr_underlyings) | (ibkr_underlyings - db_underlyings)
+    if mismatches:
+        msg = (
+            f"⚠️ Reconciliation mismatch on startup: {', '.join(sorted(mismatches))}\n"
+            "Use /reconcile to investigate."
+        )
+        logger.warning(msg)
+        await telegram_bot.send_alert(msg)
+        return False
+
+    logger.info("Reconciliation: OK — DB and IBKR positions match")
     return True
 
 
@@ -267,12 +316,7 @@ async def main() -> None:
     net_liq = ibkr.get_net_liquidation()
     logger.info("IB Gateway connected. Net Liquidation: $%s", f"{net_liq:,.2f}" if net_liq else "N/A")
 
-    # 7. State reconciliation — must pass before bot accepts new trades
-    consistent = await reconcile_state(ibkr, telegram_bot)
-    if not consistent:
-        logger.warning("State reconciliation found mismatches — new trades blocked until resolved")
-
-    # 8. Wire up modules
+    # 7. Wire up modules (before reconciliation so execution_engine is available)
     from bot.risk.engine import RiskEngine
     from bot.positions.manager import PositionManager
     from bot.execution.engine import ExecutionEngine
@@ -288,9 +332,17 @@ async def main() -> None:
         execution_engine=execution_engine,
     )
 
+    # 8. State reconciliation (orphan recovery + DB vs IBKR position check)
+    consistent = await reconcile_state(ibkr, telegram_bot, execution_engine)
+    if not consistent:
+        logger.warning("State reconciliation found mismatches — check /reconcile")
+
+    # 8b. Subscribe to real-time price ticks for all open positions
+    await position_manager.subscribe_all_open_positions()
+
     # 9. Start scheduler (scanner references wired to bot inside build_scheduler)
     heartbeat_monitor = HeartbeatMonitor()
-    scheduler = build_scheduler(config, ibkr, telegram_bot, heartbeat_monitor)
+    scheduler = build_scheduler(config, ibkr, telegram_bot, heartbeat_monitor, position_manager)
     scheduler.start()
     logger.info("Scheduler started. Jobs: %s", [j.id for j in scheduler.get_jobs()])
 

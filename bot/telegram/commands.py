@@ -263,12 +263,74 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Show open positions with Greeks. TODO (Phase 4)."""
+    """Show all open positions with current P&L and Greeks."""
     user_id = update.effective_user.id
     if not _check_rate_limit(user_id, "positions"):
         await update.message.reply_text("Please wait before refreshing positions.")
         return
-    await update.message.reply_text("/positions: TODO Phase 4")
+
+    async with get_db() as db:
+        async with db.execute(
+            """SELECT t.*, p.current_value, p.unrealised_pnl, p.delta, p.theta, p.last_updated
+               FROM trades t
+               LEFT JOIN positions p ON t.trade_id = p.trade_id
+               WHERE t.status = 'open'
+               ORDER BY t.entry_date""",
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if not rows:
+        await update.message.reply_text("No open positions.")
+        return
+
+    lines = [f"📈 OPEN POSITIONS ({len(rows)})", "──────────────────────"]
+    for row in rows:
+        t = dict(row)
+        strat    = t["strategy"]
+        ticker   = t["underlying"]
+        legs     = json.loads(t["legs"]) if isinstance(t["legs"], str) else t["legs"]
+        entry    = t.get("entry_credit") or 0
+        trade_id = t["trade_id"]
+
+        # Build header line from leg data
+        short = next((l for l in legs if l.get("action") == "SELL"), None)
+        long  = next((l for l in legs if l.get("action") == "BUY"), None)
+        expiry_short = (short["expiry"][5:] if short else "?")  # "MM-DD"
+
+        if strat == "CSP":
+            header = f"{ticker} CSP  ${short['strike']:.0f}P  {expiry_short}"
+        elif strat == "BullPutSpread":
+            header = (f"{ticker} BPS  ${short['strike']:.0f}/${long['strike']:.0f}  {expiry_short}"
+                      if short and long else f"{ticker} BPS  {expiry_short}")
+        elif strat == "LEAPCall":
+            header = f"{ticker} LEAP {short['strike']:.0f}C  {expiry_short}"
+        else:
+            header = f"{ticker} {strat}  {expiry_short}"
+
+        lines.append(f"\n[{header}]")
+        lines.append(f"  Entry: ${entry:.2f} credit")
+
+        unreal = t.get("unrealised_pnl")
+        if unreal is not None:
+            sign = "+" if unreal >= 0 else ""
+            pct  = unreal / (entry * 100) * 100 if entry else 0
+            lines.append(f"  P&L:   {sign}${unreal:.0f}  ({sign}{pct:.0f}%)  [live]")
+            delta = t.get("delta")
+            theta = t.get("theta")
+            if delta is not None or theta is not None:
+                greek_parts = []
+                if delta is not None:
+                    greek_parts.append(f"Δ {delta:.2f}")
+                if theta is not None:
+                    greek_parts.append(f"Θ ${theta:.2f}/d")
+                lines.append(f"  {' | '.join(greek_parts)}")
+        else:
+            lines.append("  P&L:   no live data (run /scan to start monitoring)")
+
+        lines.append(f"  ID: {trade_id}")
+
+    lines.append("\n/close <id>  /roll <id>")
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -327,6 +389,21 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -
         strategy = proposal["strategy"]
         underlying = proposal["underlying"]
         proposal_data = json.loads(proposal["trade_card_json"])
+
+        # Risk gate: check all limits before submitting
+        if bot.risk_engine:
+            capital = (
+                proposal_data.get("capital_required")
+                if strategy == "CSP"
+                else proposal_data.get("spread_width", 0) * 100
+            )
+            bucket = "Core" if strategy == "CSP" else "Tactical"
+            risk = await bot.risk_engine.check_new_trade(underlying, capital or 0, bucket)
+            if risk.result.value == "blocked":
+                await update.message.reply_text(f"❌ Risk check blocked: {risk.reason}")
+                return
+            if risk.result.value == "warning":
+                await update.message.reply_text(f"⚠️ Risk warning: {risk.reason}\nProceeding...")
 
         try:
             contract, price = await _build_contract_for_approval(bot, strategy, proposal_data)
@@ -449,17 +526,78 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> 
 
 
 async def cmd_roll(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Initiate roll logic. TODO (Phase 4)."""
-    await update.message.reply_text("/roll: TODO Phase 4")
+    """Show roll economics for an open CSP position."""
+    args = context.args if context.args else []
+    if not args:
+        await update.message.reply_text("Usage: /roll <trade_id>")
+        return
+
+    trade_id = args[0]
+
+    if not bot.position_manager:
+        await update.message.reply_text("Position manager not ready.")
+        return
+
+    await update.message.reply_text("⏳ Fetching roll proposal...")
+
+    async with get_db() as db:
+        try:
+            proposal = await bot.position_manager.build_roll_proposal(db, trade_id)
+        except Exception as exc:
+            logger.error("build_roll_proposal failed: %s", exc, exc_info=True)
+            await update.message.reply_text(f"Roll analysis failed: {exc}")
+            return
+
+    if proposal is None:
+        await update.message.reply_text(
+            f"No roll available for {trade_id} — check that the position is open and "
+            "market data is accessible."
+        )
+        return
+
+    if "error" in proposal:
+        await update.message.reply_text(proposal["error"])
+        return
+
+    sign = "+" if proposal["net_credit"] >= 0 else ""
+    debit_note = "  ⚠️ DEBIT ROLL — requires explicit approval" if proposal["is_debit"] else ""
+    text = (
+        f"📋 ROLL PROPOSAL — {proposal['underlying']}\n"
+        f"──────────────────────\n"
+        f"Current:  ${proposal['current_strike']:.0f}P  {proposal['current_expiry']}\n"
+        f"Roll to:  ${proposal['roll_strike']:.0f}P  {proposal['roll_expiry']} "
+        f"({proposal['roll_dte']} DTE)\n\n"
+        f"Close debit:  ${proposal['close_debit']:.2f}\n"
+        f"New credit:   ${proposal['new_credit']:.2f}\n"
+        f"Net:          {sign}${proposal['net_credit']:.2f} "
+        f"({sign}${proposal['net_credit_total']:.0f} total){debit_note}\n\n"
+        f"To execute:\n"
+        f"  1. /close {trade_id}\n"
+        f"  2. /scan  (to generate new proposal at rolled strike)\n"
+        f"  3. /approve <new_proposal_id>"
+    )
+    await update.message.reply_text(text)
 
 
 async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Show risk dashboard. TODO (Phase 4)."""
+    """Show the risk dashboard: capital allocation, P&L limits, PDT status."""
     user_id = update.effective_user.id
     if not _check_rate_limit(user_id, "risk"):
         await update.message.reply_text("Please wait before refreshing risk data.")
         return
-    await update.message.reply_text("/risk: TODO Phase 4")
+
+    if not bot.risk_engine:
+        await update.message.reply_text("Risk engine not ready.")
+        return
+
+    try:
+        text = await bot.risk_engine.format_risk_dashboard()
+    except Exception as exc:
+        logger.error("format_risk_dashboard failed: %s", exc, exc_info=True)
+        await update.message.reply_text(f"Risk dashboard error: {exc}")
+        return
+
+    await update.message.reply_text(text)
 
 
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -519,8 +657,46 @@ async def cmd_setconfig(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
         )
         return
 
-    # Phase 4: validate value type/range, apply to live config, write audit log.
-    await update.message.reply_text(f"/setconfig {param} {value}: TODO Phase 4")
+    # Parse and apply value, write audit log
+    section, field = param.split(".", 1)
+    section_obj = getattr(bot.config, section, None)
+    if section_obj is None:
+        await update.message.reply_text(f"Unknown config section: {section}")
+        return
+
+    old_value = getattr(section_obj, field, None)
+    if old_value is None:
+        await update.message.reply_text(f"Unknown config field: {field}")
+        return
+
+    # Cast to the same type as the existing value
+    try:
+        if isinstance(old_value, bool):
+            new_value = value.lower() in ("true", "1", "yes")
+        elif isinstance(old_value, int):
+            new_value = int(value)
+        elif isinstance(old_value, float):
+            new_value = float(value)
+        else:
+            new_value = value
+    except (ValueError, TypeError) as exc:
+        await update.message.reply_text(f"Invalid value '{value}' for {param}: {exc}")
+        return
+
+    setattr(section_obj, field, new_value)
+
+    async with get_db() as db:
+        await db.execute(
+            """INSERT INTO config_changes (param, old_value, new_value, changed_by, changed_at)
+               VALUES (?, ?, ?, 'user', ?)""",
+            (param, str(old_value), str(new_value), datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+
+    logger.info("Config changed: %s  %s → %s", param, old_value, new_value)
+    await update.message.reply_text(
+        f"✅ Config updated: {param}\n{old_value} → {new_value}"
+    )
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -567,9 +743,63 @@ async def cmd_removeticker(update: Update, context: ContextTypes.DEFAULT_TYPE, b
 
 
 async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Force state reconciliation. TODO (Phase 4)."""
+    """Force state reconciliation: compare DB open positions against live IBKR positions."""
     user_id = update.effective_user.id
     if not _check_rate_limit(user_id, "reconcile"):
         await update.message.reply_text("Reconciliation already in progress — please wait.")
         return
-    await update.message.reply_text("/reconcile: TODO Phase 4")
+
+    if not bot.ibkr or not bot.ibkr.is_connected:
+        await update.message.reply_text("IB Gateway not connected — cannot reconcile.")
+        return
+
+    await update.message.reply_text("⏳ Running reconciliation...")
+
+    # 1. Recover any pending_submit orphans
+    orphan_count = 0
+    if bot.execution_engine:
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT COUNT(*) FROM orders WHERE status = 'pending_submit'"
+            ) as cur:
+                row = await cur.fetchone()
+            orphan_count = row[0] if row else 0
+            if orphan_count:
+                await bot.execution_engine.recover_orphaned_orders(db)
+
+    # 2. Compare DB open trades vs IBKR live positions (options only)
+    async with get_db() as db:
+        async with db.execute(
+            "SELECT underlying, strategy, legs FROM trades WHERE status = 'open'"
+        ) as cur:
+            db_rows = await cur.fetchall()
+
+    db_underlyings = {row["underlying"] for row in db_rows}
+
+    try:
+        ibkr_positions = bot.ibkr.ib.positions()
+        ibkr_underlyings = {
+            p.contract.symbol
+            for p in ibkr_positions
+            if p.contract.secType in ("OPT", "BAG")
+        }
+    except Exception as exc:
+        await update.message.reply_text(f"IBKR position query failed: {exc}")
+        return
+
+    in_db_not_ibkr = db_underlyings - ibkr_underlyings
+    in_ibkr_not_db = ibkr_underlyings - db_underlyings
+
+    lines = ["🔄 Reconciliation complete"]
+    if orphan_count:
+        lines.append(f"  Orphaned orders checked: {orphan_count}")
+    if not in_db_not_ibkr and not in_ibkr_not_db:
+        lines.append("  ✅ DB and IBKR positions match")
+    else:
+        if in_db_not_ibkr:
+            lines.append(f"  ⚠️ In DB but not IBKR: {', '.join(sorted(in_db_not_ibkr))}")
+        if in_ibkr_not_db:
+            lines.append(f"  ⚠️ In IBKR but not DB: {', '.join(sorted(in_ibkr_not_db))}")
+        lines.append("  Review manually and use /close to correct DB state if needed.")
+
+    await update.message.reply_text("\n".join(lines))

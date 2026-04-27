@@ -60,6 +60,9 @@ class TelegramBot:
         self.position_manager = position_manager
         self.execution_engine = execution_engine
         execution_engine.on_notify = self.send_alert
+        risk_engine.on_notify = self.send_alert
+        position_manager.on_alert = self.send_alert
+        position_manager.set_execution_engine(execution_engine)
 
     def wire_scanners(self, premium_scanner, momentum_scanner) -> None:
         """
