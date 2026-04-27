@@ -6,8 +6,10 @@ All /command implementations. Registered with the Application in bot.py.
 PRD reference: §5 M3 Telegram Interface — Commands table.
 """
 
+import asyncio
 import json
 import logging
+import math
 import os
 import re
 import time as time_module
@@ -90,21 +92,35 @@ _SETCONFIG_ALLOWED: frozenset = frozenset({
 
 async def _build_contract_for_approval(bot, strategy: str, proposal_data: dict):
     """
-    Reconstruct an IBKR contract and determine the opening limit price
-    from a stored proposal JSON.
+    Reconstruct an IBKR contract and fetch a FRESH limit price via reqMktData.
 
-    CSP: re-qualifies the option (verifies it is still listed).
-    Spread: builds a BAG using stored con_ids (permanent IBKR identifiers).
+    Using proposal["credit_per_share"] as the limit price is stale (up to 2 hrs
+    old). Instead we fetch the current bid-ask mid at approve-time so the order
+    price reflects live market conditions.
+
     Returns (contract, price).
     """
+    async def _fresh_mid(contract):
+        td = bot.ibkr.ib.reqMktData(contract, genericTickList="", snapshot=False)
+        await asyncio.sleep(3)
+        bot.ibkr.ib.cancelMktData(contract)
+        bid = td.bid if td.bid and not math.isnan(td.bid) and td.bid > 0 else None
+        ask = td.ask if td.ask and not math.isnan(td.ask) and td.ask > 0 else None
+        if bid is None or ask is None:
+            raise RuntimeError(
+                f"Cannot get fresh market data for {proposal_data['underlying']} — try again"
+            )
+        return round((bid + ask) / 2, 2)
+
     if strategy == "CSP":
         from ib_async import Option
-        expiry_str = proposal_data["expiry"].replace("-", "")  # "20260516"
+        expiry_str = proposal_data["expiry"].replace("-", "")
         contract = Option(
             proposal_data["underlying"], expiry_str, proposal_data["strike"], "P", "SMART"
         )
         [qualified] = await bot.ibkr.ib.qualifyContractsAsync(contract)
-        return qualified, proposal_data["credit_per_share"]
+        price = await _fresh_mid(qualified)
+        return qualified, price
 
     if strategy == "BullPutSpread":
         from bot.builder.spread import build_bag_contract
@@ -114,7 +130,18 @@ async def _build_contract_for_approval(bot, strategy: str, proposal_data: dict):
             proposal_data["short_put_con_id"],
             proposal_data["long_put_con_id"],
         )
-        return contract, proposal_data["credit_per_share"]
+        price = await _fresh_mid(contract)
+        return contract, price
+
+    if strategy == "LEAPCall":
+        from ib_async import Option
+        expiry_str = proposal_data["expiry"].replace("-", "")
+        contract = Option(
+            proposal_data["underlying"], expiry_str, proposal_data["strike"], "C", "SMART"
+        )
+        [qualified] = await bot.ibkr.ib.qualifyContractsAsync(contract)
+        price = await _fresh_mid(qualified)
+        return qualified, price
 
     raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -392,12 +419,15 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -
 
         # Risk gate: check all limits before submitting
         if bot.risk_engine:
-            capital = (
-                proposal_data.get("capital_required")
-                if strategy == "CSP"
-                else proposal_data.get("spread_width", 0) * 100
-            )
-            bucket = "Core" if strategy == "CSP" else "Tactical"
+            if strategy == "CSP":
+                capital = proposal_data.get("capital_required", 0)
+                bucket = "Core"
+            elif strategy == "LEAPCall":
+                capital = proposal_data.get("cost_total", 0)
+                bucket = "Momentum"
+            else:  # BullPutSpread
+                capital = proposal_data.get("spread_width", 0) * 100
+                bucket = "Tactical"
             risk = await bot.risk_engine.check_new_trade(underlying, capital or 0, bucket)
             if risk.result.value == "blocked":
                 await update.message.reply_text(f"❌ Risk check blocked: {risk.reason}")
@@ -416,9 +446,12 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -
             f"⏳ Submitting {underlying} {strategy} at ${price:.2f}..."
         )
 
+        # LEAP calls are BUY orders; all premium-selling strategies are SELL orders.
+        order_action = "BUY" if strategy == "LEAPCall" else "SELL"
+
         try:
             client_order_id = await bot.execution_engine.submit_order(
-                db, contract, price, quantity=1, proposal_id=proposal_id
+                db, contract, price, quantity=1, proposal_id=proposal_id, action=order_action
             )
         except RuntimeError as exc:
             await update.message.reply_text(f"❌ {exc}")
@@ -619,18 +652,69 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
 
 
 async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Show trade journal. TODO (Phase 5)."""
-    await update.message.reply_text("/journal: TODO Phase 5")
+    """Show trade journal for the last N days (default 30)."""
+    args = context.args if context.args else []
+    days = 30
+    if args:
+        try:
+            days = int(args[0])
+            if days < 1 or days > 365:
+                await update.message.reply_text("Days must be between 1 and 365.")
+                return
+        except ValueError:
+            await update.message.reply_text("Usage: /journal [days]  (e.g. /journal 60)")
+            return
+
+    from bot.journal.journal import Journal
+    journal = Journal(bot.config)
+
+    async with get_db() as db:
+        try:
+            text = await journal.get_journal(db, days)
+        except Exception as exc:
+            logger.error("get_journal failed: %s", exc, exc_info=True)
+            await update.message.reply_text(f"Journal error: {exc}")
+            return
+
+    await update.message.reply_text(text)
 
 
 async def cmd_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Show full Wheel cycle P&L. TODO (Phase 5)."""
-    await update.message.reply_text("/wheel: TODO Phase 5")
+    """Show full Wheel cycle P&L. Usage: /wheel [cycle_id | trade_id]"""
+    args = context.args if context.args else []
+    id_arg = args[0] if args else ""
+
+    from bot.journal.journal import Journal
+    journal = Journal(bot.config)
+
+    async with get_db() as db:
+        try:
+            text = await journal.get_wheel_cycle(db, id_arg)
+        except Exception as exc:
+            logger.error("get_wheel_cycle failed: %s", exc, exc_info=True)
+            await update.message.reply_text(f"Wheel error: {exc}")
+            return
+
+    await update.message.reply_text(text)
 
 
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Show rule performance analytics. TODO (Phase 5)."""
-    await update.message.reply_text("/analyze: TODO Phase 5")
+    """Show win-rate analytics. Usage: /analyze [ivr | dte | strategy | <rule_tag>]"""
+    args = context.args if context.args else []
+    tag = args[0] if args else ""
+
+    from bot.journal.journal import Journal
+    journal = Journal(bot.config)
+
+    async with get_db() as db:
+        try:
+            text = await journal.analyze_by_tag(db, tag)
+        except Exception as exc:
+            logger.error("analyze_by_tag failed: %s", exc, exc_info=True)
+            await update.message.reply_text(f"Analyze error: {exc}")
+            return
+
+    await update.message.reply_text(text)
 
 
 async def cmd_setconfig(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:

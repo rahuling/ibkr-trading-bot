@@ -113,8 +113,8 @@ All limits are computed from **live portfolio value** fetched from IBKR on every
 
 - **Always limit orders.** Market orders only for emergency closes — a Telegram warning is sent before any market order is submitted.
 - **Spreads are submitted as BAG/combo contracts** (never two individual legs).
-- **Idempotent crash recovery**: `client_order_id` (UUID) is written to the `orders` table *before* the order is sent to IBKR. On startup, the bot checks for any orders in `pending_submit` state and reconciles against live IBKR positions.
-- **Repricing**: if an order is unfilled after 5 minutes, reprice 1 tick toward the ask and resubmit once. If still unfilled after 3 more minutes, cancel and notify.
+- **Idempotent crash recovery**: `client_order_id` (UUID) is written to the `orders` table *before* the order is sent to IBKR. On startup, the bot checks `pending_submit` orders (crash before/during submit) against live IBKR open orders, and `submitted` orders (crash after submit but before fill was recorded) against IBKR execution reports — ensuring no fill is ever lost across a restart.
+- **Repricing**: if an order is unfilled after 5 minutes, reprice 1 tick *lower* (accept less credit) to attract a fill and resubmit once. If still unfilled after 3 more minutes, cancel and notify.
 - **Tick size**: $0.05 for options < $3.00, $0.10 for options ≥ $3.00.
 - **Proposal TTL**: 2 hours from generation, hard capped at 4:00pm ET.
 
@@ -135,14 +135,14 @@ All limits are computed from **live portfolio value** fetched from IBKR on every
 | `/positions` | All open positions with live Greeks |
 | `/close [id]` | Manually close a position |
 | `/roll [id]` | Initiate roll logic |
-| `/wheel [id]` | Full Wheel cycle P&L for an underlying |
+| `/wheel [id]` | Full Wheel cycle P&L (CSP → assignment → CC); omit id to list recent cycles |
 
 ### Risk & P&L
 | Command | Description |
 |---------|-------------|
 | `/risk` | Capital allocation, bucket usage, loss limit status |
-| `/journal [days]` | Trade journal (default 30 days) |
-| `/analyze [tag]` | Win rate and P&L breakdown by rule tag |
+| `/journal [days]` | Trade journal (default 30 days) — entry/exit/P&L for every closed trade |
+| `/analyze [dim]` | Win rate and avg P&L breakdown — dims: `ivr`, `dte`, `strategy`, or a rule tag; default shows all three |
 
 ### Configuration
 | Command | Description |
@@ -307,7 +307,7 @@ All parameters can be viewed at runtime with `/config` and changed with `/setcon
 
 ## Development status
 
-The codebase is structured in build phases. Each module has stubs and `TODO (Phase N)` markers showing what needs to be implemented next.
+All phases are complete. The bot is ready for paper trading.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
@@ -315,8 +315,8 @@ The codebase is structured in build phases. Each module has stubs and `TODO (Pha
 | 2 | Premium scanner (M1) + CSP/Spread TradeBuilder (M2) | Done |
 | 3 | Execution Engine (M4): order submission, repricing, crash recovery | Done |
 | 4 | Risk Engine (M6) + Position Manager (M5): live checks, PDT, reconciliation | Done |
-| 5a | Journal (M7): trade logging, monthly reports, `/analyze` | Not started |
-| 5b | EOD Momentum scanner + LEAP builder | Not started |
+| 5a | Journal (M7): `/journal`, `/wheel`, `/analyze`, monthly auto-report | Done |
+| 5b | EOD Momentum scanner + LEAP call builder | Done |
 
 ---
 

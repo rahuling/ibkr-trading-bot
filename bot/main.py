@@ -325,6 +325,8 @@ async def main() -> None:
     position_manager = PositionManager(config, ibkr, risk_engine)
     execution_engine = ExecutionEngine(config, ibkr, risk_engine)
 
+    execution_engine.set_position_manager(position_manager)
+
     telegram_bot.wire(
         ibkr=ibkr,
         risk_engine=risk_engine,
@@ -337,8 +339,9 @@ async def main() -> None:
     if not consistent:
         logger.warning("State reconciliation found mismatches — check /reconcile")
 
-    # 8b. Subscribe to real-time price ticks for all open positions
+    # 8b. Subscribe to real-time price ticks and wire assignment detection
     await position_manager.subscribe_all_open_positions()
+    position_manager.setup_assignment_detection()
 
     # 9. Start scheduler (scanner references wired to bot inside build_scheduler)
     heartbeat_monitor = HeartbeatMonitor()

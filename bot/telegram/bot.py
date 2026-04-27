@@ -79,6 +79,7 @@ class TelegramBot:
         self.premium_scanner = premium_scanner
         self.momentum_scanner = momentum_scanner
         premium_scanner.on_proposal = self.send_alert
+        momentum_scanner.on_proposal = self.send_alert
 
     async def run(self) -> None:
         """

@@ -67,6 +67,55 @@ class PositionManager:
             if position["underlying"] not in self._subscriptions:
                 await self.subscribe_position(position)
 
+    def setup_assignment_detection(self) -> None:
+        """
+        Subscribe to IBKR positionEvent to detect option assignments.
+
+        Fires whenever the broker account position for any contract changes.
+        We look for a short put going to 0 while stock appears → assignment.
+        Called once at startup after state reconciliation.
+        """
+        self.ibkr.ib.positionEvent += self._on_ibkr_position_update
+        logger.info("Assignment detection wired to positionEvent")
+
+    def _on_ibkr_position_update(self, ibkr_pos) -> None:
+        asyncio.create_task(self._check_assignment(ibkr_pos))
+
+    async def _check_assignment(self, ibkr_pos) -> None:
+        """Detect assignment: short put goes to 0 AND stock appears in account."""
+        contract = ibkr_pos.contract
+        if contract.secType != "OPT" or ibkr_pos.position != 0:
+            return
+
+        from bot.database import get_db
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT * FROM trades WHERE underlying = ? AND strategy = 'CSP' AND status = 'open'",
+                (contract.symbol,),
+            ) as cur:
+                rows = await cur.fetchall()
+
+        for row in rows:
+            position = dict(row)
+            legs = json.loads(position["legs"])
+            leg = legs[0]
+            expiry_compact = contract.lastTradeDateOrContractMonth.replace("-", "")
+            if (
+                abs(float(leg["strike"]) - float(contract.strike)) < 0.01
+                and leg["expiry"].replace("-", "") == expiry_compact
+            ):
+                ibkr_positions = self.ibkr.ib.positions()
+                has_stock = any(
+                    p.contract.symbol == contract.symbol
+                    and p.contract.secType == "STK"
+                    and p.position >= 100
+                    for p in ibkr_positions
+                )
+                if has_stock:
+                    async with get_db() as db:
+                        await self.handle_assignment(db, position)
+                break
+
     # ------------------------------------------------------------------
     # Event-driven price monitoring
     # ------------------------------------------------------------------
@@ -111,6 +160,9 @@ class PositionManager:
         ticker.updateEvent -= handler
         self.ibkr.ib.cancelMktData(contract)
         logger.info("Unsubscribed from %s price ticks", underlying)
+        trade_id = position.get("trade_id")
+        if trade_id:
+            self._alerted = {k for k in self._alerted if k[0] != trade_id}
 
     async def on_price_update(self, ticker, position, on_alert: Callable = None) -> None:
         """
@@ -401,12 +453,13 @@ class PositionManager:
 
         now = datetime.now(timezone.utc)
 
+        pnl = round(entry_credit * 100, 2)  # premium collected is kept on assignment
         await db.execute(
             """UPDATE trades
                SET status = 'closed', exit_date = ?, exit_reason = 'assignment',
-                   outcome = 'Assigned', exit_price = 0, pnl = 0
+                   outcome = 'Assigned', exit_price = 0, pnl = ?
                WHERE trade_id = ?""",
-            (now.isoformat(), trade_id),
+            (now.isoformat(), pnl, trade_id),
         )
 
         cycle_id = position.get("wheel_cycle_id")
