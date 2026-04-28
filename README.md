@@ -13,7 +13,8 @@ The bot manages three separate capital buckets and runs a different options stra
 Sells cash-secured puts on blue-chip equities and ETFs (SPY, QQQ, IWM, GLD, AAPL, MSFT, NVDA, AMZN, GOOGL). If assigned, switches to covered calls on the shares until they are called away, then cycles back to CSPs. The full CSP → assignment → CC → call-away sequence is tracked as a single "wheel cycle" in the database.
 
 - **CSP parameters**: 30–45 DTE, target delta -0.27 (±0.03), close at 50% of max credit
-- **Covered call parameters**: 7–21 DTE, target delta 0.28, close at 75% of max credit
+- **Covered call parameters**: 7–21 DTE, target delta 0.28 (±0.05), close at 75% of max credit
+- **Assignment flow**: on assignment the bot immediately generates a covered call proposal (or alerts to run `/scan` next morning if market is closed)
 
 ### Strategy 2 — Bull Put Spreads (Tactical bucket, 20% of portfolio)
 
@@ -45,30 +46,31 @@ bot/
 ├── ibkr.py              IB Gateway connection wrapper (ib_async).
 │
 ├── scanner/
-│   ├── base.py          IV history update (runs 4:15pm daily).
-│   ├── premium.py       M1: Premium scanner — 9:45am + 3:00pm ET.
-│   └── momentum.py      M1: EOD momentum scanner — 3:30pm ET.
+│   ├── base.py          IV/IVR utilities; update_iv_history (runs 4:15pm daily).
+│   ├── premium.py       Premium scanner — 9:45am + 3:00pm ET (CSP + Spread).
+│   └── momentum.py      EOD momentum scanner — 3:30pm ET (LEAP).
 │
 ├── builder/
-│   ├── csp.py           M2: CSP proposal builder + Telegram trade card formatter.
-│   ├── spread.py        M2: Bull put spread proposal builder.
-│   └── leap.py          M2: LEAP call proposal builder + trade card formatter.
+│   ├── csp.py           CSP proposal builder + trade card formatter.
+│   ├── spread.py        Bull put spread proposal builder.
+│   ├── leap.py          LEAP call proposal builder + trade card formatter.
+│   └── cc.py            Covered call proposal builder (post-assignment Wheel phase).
 │
 ├── execution/
-│   └── engine.py        M4: Order submission, repricing, orphan recovery on restart.
+│   └── engine.py        Order submission, repricing (open + close), orphan recovery.
 │
 ├── positions/
-│   └── manager.py       M5: Position state, Greeks polling, assignment detection.
+│   └── manager.py       Position state, Greeks polling, assignment detection, roll logic.
 │
 ├── risk/
-│   └── engine.py        M6: Circuit breakers, loss limits, PDT monitoring.
+│   └── engine.py        Circuit breakers, loss limits, PDT monitoring.
 │
 ├── journal/
-│   └── journal.py       M7: Trade logging, P&L reports, rule-tag analytics.
+│   └── journal.py       Trade logging, P&L reports, rule-tag analytics.
 │
 └── telegram/
-    ├── bot.py           Telegram Application setup, auth filter.
-    ├── commands.py      M3: All /command handlers.
+    ├── bot.py           Telegram Application setup, auth filter, morning summary.
+    ├── commands.py      All /command handlers.
     └── notifications.py Outbound alerts (scan results, fills, circuit breakers).
 ```
 
@@ -76,13 +78,13 @@ bot/
 
 | Time | Job |
 |------|-----|
-| 9:30am | Morning summary pushed to Telegram |
+| 9:30am | Morning summary — portfolio value, open positions, expiry alerts, P&L |
 | 9:45am | Premium-selling scan (Core + Tactical) |
 | 3:00pm | Afternoon premium-selling scan |
 | 3:30pm | EOD momentum scan |
 | 4:15pm | IV history update (after market close) |
-| Every 5 min | Position monitor — updates P&L/Greeks in DB, fires profit-target alerts |
-| Every 5 min | Heartbeat — alerts on 2 consecutive misses |
+| Every 5 min | Position monitor — updates P&L/Greeks in DB, fires profit-target and strike-tested alerts |
+| Every 5 min | Heartbeat — alerts on 2 consecutive misses; sends recovery notice on reconnect |
 | 1st of month, 8am | Monthly P&L report |
 
 ---
@@ -114,9 +116,11 @@ All limits are computed from **live portfolio value** fetched from IBKR on every
 - **Always limit orders.** Market orders only for emergency closes — a Telegram warning is sent before any market order is submitted.
 - **Spreads are submitted as BAG/combo contracts** (never two individual legs).
 - **Idempotent crash recovery**: `client_order_id` (UUID) is written to the `orders` table *before* the order is sent to IBKR. On startup, the bot checks `pending_submit` orders (crash before/during submit) against live IBKR open orders, and `submitted` orders (crash after submit but before fill was recorded) against IBKR execution reports — ensuring no fill is ever lost across a restart.
-- **Repricing**: if an order is unfilled after 5 minutes, reprice 1 tick *lower* (accept less credit) to attract a fill and resubmit once. If still unfilled after 3 more minutes, cancel and notify.
+- **Open order repricing**: if an order is unfilled after 5 minutes, reprice 1 tick lower (accept less credit) and resubmit once. If still unfilled after 3 more minutes, cancel and notify.
+- **Close order repricing**: if a close order is unfilled after 5 minutes, reprice 1 tick toward fill (raise limit for BUY-to-close, lower for SELL-to-close LEAP) and resubmit once. If still unfilled, cancel and alert.
 - **Tick size**: $0.05 for options < $3.00, $0.10 for options ≥ $3.00.
-- **Proposal TTL**: 2 hours from generation, hard capped at 4:00pm ET.
+- **Proposal TTL**: configurable (default 2 hours), hard capped at the close blackout window (3:55pm ET) so proposals never linger in "pending" state after market close.
+- **Duplicate prevention**: the scanner skips tickers that already have a pending proposal, preventing duplicate sends between the 9:45am and 3pm scans.
 
 ---
 
@@ -125,16 +129,16 @@ All limits are computed from **live portfolio value** fetched from IBKR on every
 ### Scanning & proposals
 | Command | Description |
 |---------|-------------|
-| `/scan` | Trigger a manual scan |
-| `/approve [id]` | Approve a trade proposal — submits the order |
+| `/scan` | Trigger a manual scan (CSP, Spread, and any pending Wheel/CC proposals) |
+| `/approve [id]` | Approve a trade proposal — fetches fresh market data and submits the order |
 | `/reject [id] [reason]` | Reject a trade proposal |
 
 ### Positions
 | Command | Description |
 |---------|-------------|
-| `/positions` | All open positions with live Greeks |
-| `/close [id]` | Manually close a position |
-| `/roll [id]` | Initiate roll logic |
+| `/positions` | All open positions with live P&L and Greeks |
+| `/close [id]` | Manually close a position (limit / bid / market) |
+| `/roll [id]` | Show roll economics for an open CSP |
 | `/wheel [id]` | Full Wheel cycle P&L (CSP → assignment → CC); omit id to list recent cycles |
 
 ### Risk & P&L
@@ -142,16 +146,16 @@ All limits are computed from **live portfolio value** fetched from IBKR on every
 |---------|-------------|
 | `/risk` | Capital allocation, bucket usage, loss limit status |
 | `/journal [days]` | Trade journal (default 30 days) — entry/exit/P&L for every closed trade |
-| `/analyze [dim]` | Win rate and avg P&L breakdown — dims: `ivr`, `dte`, `strategy`, or a rule tag; default shows all three |
+| `/analyze [dim]` | Win rate and avg P&L breakdown — dims: `ivr`, `dte`, `strategy`, or a rule tag |
 
 ### Configuration
 | Command | Description |
 |---------|-------------|
 | `/config` | Show current configuration |
-| `/setconfig [param] [value]` | Adjust a parameter at runtime (all changes are audited in DB) |
+| `/setconfig [param] [value]` | Adjust a parameter at runtime (audited in DB) |
 | `/watchlist` | Show all three watchlists |
-| `/addticker [ticker]` | Add a ticker to a watchlist |
-| `/removeticker [ticker]` | Remove a ticker from a watchlist |
+| `/addticker [ticker] [bucket]` | Add a ticker to a watchlist (`core`, `tactical`, or `momentum`) |
+| `/removeticker [ticker] [bucket]` | Remove a ticker from a watchlist |
 
 ### System
 | Command | Description |
@@ -183,12 +187,12 @@ SQLite, WAL mode. File: `data/trading.db`. Schema is in `bot/database.py`.
 |-------|---------|
 | `wheel_cycles` | Full Wheel cycle from CSP entry to CC exit |
 | `trades` | Every trade: entry, exit, outcome, rule tags, Greeks snapshot |
-| `positions` | Live position state (updated on each poll) |
+| `positions` | Live position state (updated on each 5-min poll) |
 | `proposals` | Pending trade proposals awaiting `/approve` or `/reject` |
 | `orders` | Full order lifecycle — pending → submitted → filled |
 | `risk_events` | Circuit breaker events (daily limit hit, PDT warning, etc.) |
 | `iv_history` | Daily IV per ticker for IVR calculation (252-day bootstrap required) |
-| `config_changes` | Audit log of every `/setconfig` change |
+| `config_changes` | Audit log of every `/setconfig`, `/addticker`, `/removeticker` change |
 
 **Schema rule**: all changes must be additive. Never drop or rename columns once deployed to a live account.
 
@@ -252,8 +256,9 @@ The bot will:
 2. Initialise the SQLite database (safe to run repeatedly)
 3. Connect to IB Gateway
 4. Reconcile DB positions against live IBKR positions
-5. Start the scheduler
-6. Start the Telegram bot
+5. Subscribe to real-time price ticks for all open positions
+6. Start the scheduler
+7. Start the Telegram bot
 
 Send `/status` in Telegram to confirm everything is connected.
 
@@ -296,27 +301,33 @@ All parameters can be viewed at runtime with `/config` and changed with `/setcon
 | `trading.csp` | `target_delta` | -0.27 | Target put delta for CSPs |
 | `trading.csp` | `dte_min/max` | 30–45 | DTE range for CSP expiry selection |
 | `trading.csp` | `profit_close_pct` | 0.50 | Close CSP when credit decays 50% |
+| `trading.covered_call` | `target_delta` | 0.28 | Target call delta for covered calls |
+| `trading.covered_call` | `dte_min/max` | 7–21 | DTE range for CC expiry selection |
+| `trading.covered_call` | `profit_close_pct` | 0.75 | Close CC at 75% of max credit |
 | `trading.spread` | `spread_width` | 5 | Bull put spread width in dollars |
 | `trading.spread` | `profit_close_pct` | 0.75 | Close spread at 75% of max credit |
 | `leap` | `target_delta` | 0.78 | Target LEAP call delta |
 | `leap` | `stop_loss_pct` | 0.02 | 2% adverse move on underlying → close |
 | `leap` | `profit_target_pct` | 0.08 | 8% favourable move → close |
+| `execution` | `reprice_wait_minutes` | 5 | Minutes before repricing an unfilled order |
+| `execution` | `proposal_ttl_minutes` | 120 | Proposal expiry (capped at close blackout) |
 | `automation` | `level` | 2 | 1=alerts, 2=assisted, 3=autonomous |
 
 ---
 
 ## Development status
 
-All phases are complete. The bot is ready for paper trading.
+All phases complete. Full bug sweep done. Ready for paper trading.
 
 | Phase | Scope | Status |
 |-------|-------|--------|
 | 1 | Infrastructure: config, DB schema, IB Gateway connection, Telegram `/status` | Done |
-| 2 | Premium scanner (M1) + CSP/Spread TradeBuilder (M2) | Done |
-| 3 | Execution Engine (M4): order submission, repricing, crash recovery | Done |
-| 4 | Risk Engine (M6) + Position Manager (M5): live checks, PDT, reconciliation | Done |
-| 5a | Journal (M7): `/journal`, `/wheel`, `/analyze`, monthly auto-report | Done |
-| 5b | EOD Momentum scanner + LEAP call builder | Done |
+| 2 | Premium scanner + CSP / Spread / LEAP / CC trade builders | Done |
+| 3 | Execution engine: order submission, repricing (open + close), crash recovery | Done |
+| 4 | Risk engine + Position manager: live checks, PDT, assignment detection, reconciliation | Done |
+| 5a | Journal: `/journal`, `/wheel`, `/analyze`, monthly auto-report | Done |
+| 5b | EOD momentum scanner + LEAP call builder | Done |
+| Bug sweep | All critical (C1–C5), major (M2–M11), and minor (N1–N10) issues resolved | Done |
 
 ---
 
