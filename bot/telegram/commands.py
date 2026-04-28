@@ -122,6 +122,16 @@ async def _build_contract_for_approval(bot, strategy: str, proposal_data: dict):
         price = await _fresh_mid(qualified)
         return qualified, price
 
+    if strategy == "CoveredCall":
+        from ib_async import Option
+        expiry_str = proposal_data["expiry"].replace("-", "")
+        contract = Option(
+            proposal_data["underlying"], expiry_str, proposal_data["strike"], "C", "SMART"
+        )
+        [qualified] = await bot.ibkr.ib.qualifyContractsAsync(contract)
+        price = await _fresh_mid(qualified)
+        return qualified, price
+
     if strategy == "BullPutSpread":
         from bot.builder.spread import build_bag_contract
         contract = build_bag_contract(
@@ -261,6 +271,90 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) ->
 # Stubs — implemented in later phases
 # ---------------------------------------------------------------------------
 
+async def _scan_for_cc_proposals(update, bot) -> None:
+    """
+    M6: Generate CC proposals for assigned Wheel positions that don't yet have an open CC.
+
+    Called from cmd_scan so /scan covers the full Wheel cycle, not just CSP/Spread.
+    """
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from bot.builder.cc import build_cc_proposal, format_cc_trade_card
+
+    async with get_db() as db:
+        async with db.execute(
+            """SELECT wc.underlying,
+                      t.entry_credit AS csp_credit,
+                      t.legs         AS csp_legs
+               FROM wheel_cycles wc
+               JOIN trades t ON t.wheel_cycle_id = wc.cycle_id
+                            AND t.strategy = 'CSP'
+               WHERE wc.status = 'open'
+                 AND wc.shares_assigned = 1
+                 AND NOT EXISTS (
+                     SELECT 1 FROM trades cc
+                     WHERE cc.wheel_cycle_id = wc.cycle_id
+                       AND cc.strategy = 'CoveredCall'
+                       AND cc.status = 'open'
+                 )"""
+        ) as cur:
+            assigned_rows = await cur.fetchall()
+
+    if not assigned_rows:
+        return
+
+    await update.message.reply_text(
+        f"📋 Found {len(assigned_rows)} assigned position(s) needing Covered Call..."
+    )
+
+    now = datetime.now(timezone.utc)
+    generated = 0
+    for row in assigned_rows:
+        underlying = row["underlying"]
+        csp_credit = row["csp_credit"] or 0
+        csp_legs   = json.loads(row["csp_legs"]) if isinstance(row["csp_legs"], str) else row["csp_legs"]
+        csp_leg    = next((l for l in csp_legs if l.get("action") == "SELL"), None)
+        strike     = csp_leg.get("strike", 0) if csp_leg else 0
+        net_cost   = round(strike - csp_credit, 2)
+
+        try:
+            proposal = await build_cc_proposal(bot.config, bot.ibkr, underlying, net_cost)
+            if not proposal:
+                await update.message.reply_text(
+                    f"{underlying}: no CC proposal available (market data unavailable or no valid strike)."
+                )
+                continue
+
+            proposal_id = uuid.uuid4().hex[:6].upper()
+            trade_card  = format_cc_trade_card(proposal, proposal_id)
+
+            async with get_db() as db:
+                await db.execute(
+                    """INSERT INTO proposals
+                       (proposal_id, underlying, strategy, trade_card_json,
+                        status, created_at, expires_at)
+                       VALUES (?, ?, 'CoveredCall', ?, 'pending', ?, ?)""",
+                    (
+                        proposal_id,
+                        underlying,
+                        json.dumps(proposal.__dict__),
+                        now.isoformat(),
+                        (now + timedelta(hours=20)).isoformat(),
+                    ),
+                )
+                await db.commit()
+
+            await update.message.reply_text(trade_card)
+            generated += 1
+        except Exception as exc:
+            logger.error("CC proposal generation failed for %s: %s", underlying, exc, exc_info=True)
+            await update.message.reply_text(f"{underlying}: CC proposal error — {exc}")
+
+    if generated:
+        await update.message.reply_text(f"✅ {generated} CC proposal(s) generated.")
+
+
 async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Trigger manual premium-selling scan."""
     user_id = update.effective_user.id
@@ -287,6 +381,10 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
     except Exception as exc:
         logger.error("cmd_scan failed: %s", exc, exc_info=True)
         await update.message.reply_text("Scan failed — check logs.")
+        return
+
+    # M6: also generate CC proposals for any assigned positions without an active CC.
+    await _scan_for_cc_proposals(update, bot)
 
 
 async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
@@ -330,12 +428,17 @@ async def cmd_positions(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
             header = (f"{ticker} BPS  ${short['strike']:.0f}/${long['strike']:.0f}  {expiry_short}"
                       if short and long else f"{ticker} BPS  {expiry_short}")
         elif strat == "LEAPCall":
-            header = f"{ticker} LEAP {short['strike']:.0f}C  {expiry_short}"
+            exp = long["expiry"][5:] if long else "?"
+            header = (f"{ticker} LEAP ${long['strike']:.0f}C  {exp}" if long
+                      else f"{ticker} LEAP  {expiry_short}")
+        elif strat == "CoveredCall":
+            header = f"{ticker} CC  ${short['strike']:.0f}C  {expiry_short}" if short else f"{ticker} CC  {expiry_short}"
         else:
             header = f"{ticker} {strat}  {expiry_short}"
 
         lines.append(f"\n[{header}]")
-        lines.append(f"  Entry: ${entry:.2f} credit")
+        cost_label = "cost" if strat == "LEAPCall" else "credit"
+        lines.append(f"  Entry: ${entry:.2f} {cost_label}")
 
         unreal = t.get("unrealised_pnl")
         if unreal is not None:
@@ -419,14 +522,14 @@ async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -
 
         # Risk gate: check all limits before submitting
         if bot.risk_engine:
-            if strategy == "CSP":
-                capital = proposal_data.get("capital_required", 0)
+            if strategy in ("CSP", "CoveredCall"):
+                capital = proposal_data.get("capital_required", 0) or 0
                 bucket = "Core"
             elif strategy == "LEAPCall":
-                capital = proposal_data.get("cost_total", 0)
+                capital = proposal_data.get("cost_total", 0) or 0
                 bucket = "Momentum"
             else:  # BullPutSpread
-                capital = proposal_data.get("spread_width", 0) * 100
+                capital = (proposal_data.get("spread_width", 0) or 0) * 100
                 bucket = "Tactical"
             risk = await bot.risk_engine.check_new_trade(underlying, capital or 0, bucket)
             if risk.result.value == "blocked":

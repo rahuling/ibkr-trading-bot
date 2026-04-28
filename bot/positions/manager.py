@@ -202,6 +202,24 @@ class PositionManager:
                     # Price recovered — clear so the alert can fire again next time
                     self._alerted.discard(alert_key)
 
+        # CoveredCall: alert when stock trades at or above the call strike (assignment risk)
+        elif strategy == "CoveredCall":
+            legs = json.loads(position["legs"]) if isinstance(position["legs"], str) else position["legs"]
+            short_leg = next((l for l in legs if l.get("action") == "SELL"), None)
+            if short_leg:
+                strike = short_leg.get("strike", 0)
+                itm_key = (trade_id, "cc_itm")
+                if strike and price >= strike and itm_key not in self._alerted:
+                    self._alerted.add(itm_key)
+                    if alert_fn:
+                        await alert_fn(
+                            f"📈 CC IN-THE-MONEY: {position['underlying']} at ${price:.2f} "
+                            f"(above ${strike:.0f} call — stock may be called away)\n"
+                            f"Trade: {trade_id[:8]}..."
+                        )
+                elif strike and price < strike * 0.98:
+                    self._alerted.discard(itm_key)
+
         # LEAP Calls: stop-loss / profit-target monitoring (underlying price-based)
         elif strategy == "LEAPCall":
             stop_price   = position.get("stop_price")
@@ -267,13 +285,17 @@ class PositionManager:
         entry_credit  = position.get("entry_credit") or 0.0
         legs = json.loads(position["legs"]) if isinstance(position["legs"], str) else position["legs"]
 
-        short_leg = next((l for l in legs if l.get("action") == "SELL"), None)
-        if not short_leg:
+        # LEAP is a long call (BUY leg); all premium-selling strategies have a SELL leg.
+        if strategy == "LEAPCall":
+            active_leg = next((l for l in legs if l.get("action") == "BUY"), None)
+        else:
+            active_leg = next((l for l in legs if l.get("action") == "SELL"), None)
+        if not active_leg:
             return
 
-        expiry = short_leg["expiry"].replace("-", "")
+        expiry = active_leg["expiry"].replace("-", "")
         try:
-            opt = Option(underlying, expiry, short_leg["strike"], short_leg["right"], "SMART")
+            opt = Option(underlying, expiry, active_leg["strike"], active_leg.get("right", "P"), "SMART")
             [qualified] = await self.ibkr.ib.qualifyContractsAsync(opt)
             td = self.ibkr.ib.reqMktData(qualified, genericTickList="", snapshot=False)
             await asyncio.sleep(3)
@@ -295,7 +317,12 @@ class PositionManager:
             delta = g.delta if g.delta and not math.isnan(g.delta) else None
             theta = g.theta if g.theta and not math.isnan(g.theta) else None
 
-        unrealised_pnl = round((entry_credit - mid) * 100, 2)
+        # LEAP: bought at entry_credit, profit when mid rises.
+        # Premium-selling: sold at entry_credit, profit when mid falls.
+        if strategy == "LEAPCall":
+            unrealised_pnl = round((mid - entry_credit) * 100, 2)
+        else:
+            unrealised_pnl = round((entry_credit - mid) * 100, 2)
         current_value  = round(mid * 100, 2)
         now = datetime.now(timezone.utc)
 
@@ -315,6 +342,10 @@ class PositionManager:
                  unrealised_pnl, delta, theta, now.isoformat()),
             )
             await db.commit()
+
+        # LEAP exits use underlying price alerts (on_price_update), not option mid.
+        if strategy == "LEAPCall":
+            return
 
         # Profit-target alert (strategy-specific threshold)
         if strategy == "CSP":
@@ -431,6 +462,29 @@ class PositionManager:
         logger.info("Wheel cycle created: %s for %s", cycle_id, underlying)
         return cycle_id
 
+    async def link_cc_to_wheel_cycle(self, db, underlying: str, cc_trade_id: str) -> None:
+        """Link a filled CoveredCall trade to the most recent open wheel cycle for underlying."""
+        async with db.execute(
+            """SELECT cycle_id FROM wheel_cycles
+               WHERE underlying = ? AND status = 'open' AND shares_assigned = 1
+               ORDER BY started_at DESC LIMIT 1""",
+            (underlying,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row:
+            cycle_id = row["cycle_id"]
+            await db.execute(
+                "UPDATE trades SET wheel_cycle_id = ? WHERE trade_id = ?",
+                (cycle_id, cc_trade_id),
+            )
+            await db.commit()
+            logger.info("Linked CoveredCall %s to wheel cycle %s", cc_trade_id, cycle_id)
+        else:
+            logger.warning(
+                "No assigned open wheel cycle for %s — CoveredCall %s not linked",
+                underlying, cc_trade_id,
+            )
+
     async def handle_assignment(self, db, position, on_alert: Callable = None) -> None:
         """
         Called when IBKR account update shows assignment (long stock appears,
@@ -469,6 +523,7 @@ class PositionManager:
                 (cycle_id,),
             )
 
+        await db.execute("DELETE FROM positions WHERE trade_id = ?", (trade_id,))
         await db.commit()
 
         self.unsubscribe_position(position)
@@ -478,10 +533,58 @@ class PositionManager:
             await alert_fn(
                 f"📉 ASSIGNED: 100 shares of {underlying} received.\n"
                 f"Net cost basis: ${net_cost:.2f}/share  (strike ${strike:.0f} − credit ${entry_credit:.2f})\n"
-                f"Covered Call proposal queued for next morning scan."
+                f"Building Covered Call proposal..."
             )
 
         logger.info("Assignment handled: %s trade=%s", underlying, trade_id)
+
+        # Generate a Covered Call proposal immediately if market data is available,
+        # otherwise fall back to alerting the user to run /scan next morning.
+        try:
+            import uuid
+            import json as _json
+            from datetime import timedelta
+            from bot.builder.cc import build_cc_proposal, format_cc_trade_card
+            from bot.database import get_db as _get_db
+
+            cc_proposal = await build_cc_proposal(self.config, self.ibkr, underlying, net_cost)
+            if cc_proposal:
+                proposal_id = uuid.uuid4().hex[:6].upper()
+                trade_card = format_cc_trade_card(cc_proposal, proposal_id)
+                now_utc = datetime.now(timezone.utc)
+                expires_at = now_utc + timedelta(hours=20)
+
+                async with _get_db() as cc_db:
+                    await cc_db.execute(
+                        """INSERT INTO proposals
+                           (proposal_id, underlying, strategy, trade_card_json,
+                            status, created_at, expires_at)
+                           VALUES (?, ?, 'CoveredCall', ?, 'pending', ?, ?)""",
+                        (
+                            proposal_id,
+                            underlying,
+                            _json.dumps(cc_proposal.__dict__),
+                            now_utc.isoformat(),
+                            expires_at.isoformat(),
+                        ),
+                    )
+                    await cc_db.commit()
+
+                if alert_fn:
+                    await alert_fn(trade_card)
+            else:
+                if alert_fn:
+                    await alert_fn(
+                        f"📋 Covered Call proposal: market data unavailable now.\n"
+                        f"Run /scan tomorrow morning to generate a CC proposal for {underlying}."
+                    )
+        except Exception as exc:
+            logger.error("CC proposal generation failed after %s assignment: %s", underlying, exc)
+            if alert_fn:
+                await alert_fn(
+                    f"⚠️ Could not generate Covered Call proposal for {underlying}: {exc}\n"
+                    "Use /scan to generate it manually."
+                )
 
     # ------------------------------------------------------------------
     # Roll logic

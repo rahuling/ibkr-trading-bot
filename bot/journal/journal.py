@@ -72,7 +72,7 @@ def _leg_header(t: dict) -> str:
     if s == "CoveredCall":
         return f"{und} CC ${short['strike']:.0f}C" if short else f"{und} CC"
     if s == "LEAPCall":
-        return f"{und} LEAP ${short['strike']:.0f}C" if short else f"{und} LEAP"
+        return f"{und} LEAP ${long_leg['strike']:.0f}C" if long_leg else f"{und} LEAP"
     return f"{und} {s}"
 
 

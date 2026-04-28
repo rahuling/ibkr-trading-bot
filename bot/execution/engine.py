@@ -134,7 +134,7 @@ class ExecutionEngine:
 
         # Fill monitor runs as a fire-and-forget task so the caller returns immediately.
         asyncio.create_task(
-            self._monitor_fill(ib_trade, client_order_id, contract, price, quantity, proposal_id)
+            self._monitor_fill(ib_trade, client_order_id, contract, price, quantity, proposal_id, action)
         )
 
         return client_order_id
@@ -147,6 +147,7 @@ class ExecutionEngine:
         price: float,
         quantity: int,
         proposal_id: str,
+        action: str = "SELL",
     ) -> None:
         """Poll for fill; trigger reprice_and_retry if still open after reprice_wait_minutes."""
         from bot.database import get_db
@@ -173,7 +174,7 @@ class ExecutionEngine:
                     logger.info("Order %s done with status %s", client_order_id, ib_trade.orderStatus.status)
             else:
                 await self.reprice_and_retry(
-                    db, client_order_id, price, ib_trade, contract, quantity, proposal_id
+                    db, client_order_id, price, ib_trade, contract, quantity, proposal_id, action
                 )
 
     async def _record_fill(self, db, client_order_id: str, fill_price: float, proposal_id: str) -> None:
@@ -206,6 +207,16 @@ class ExecutionEngine:
                 "strike": proposal_data["strike"],
                 "expiry": proposal_data["expiry"],
                 "right": "P",
+                "qty": 1,
+                "action": "SELL",
+            }])
+            bucket = "Core"
+            entry_delta = proposal_data.get("delta")
+        elif strategy == "CoveredCall":
+            legs = json.dumps([{
+                "strike": proposal_data["strike"],
+                "expiry": proposal_data["expiry"],
+                "right": "C",
                 "qty": 1,
                 "action": "SELL",
             }])
@@ -290,6 +301,22 @@ class ExecutionEngine:
 
         if strategy == "CSP" and self._position_manager:
             await self._position_manager.create_wheel_cycle(db, underlying, trade_id)
+        elif strategy == "CoveredCall" and self._position_manager:
+            await self._position_manager.link_cc_to_wheel_cycle(db, underlying, trade_id)
+
+        # M5: subscribe immediately so event-driven monitoring starts now,
+        # not at the next 5-minute check_all_positions poll.
+        if self._position_manager:
+            position_for_monitor = {
+                "trade_id": trade_id,
+                "underlying": underlying,
+                "strategy": strategy,
+                "legs": legs,
+                "entry_credit": fill_price,
+                "stop_price": stop_price,
+                "profit_target_price": profit_target_price,
+            }
+            asyncio.create_task(self._position_manager.subscribe_position(position_for_monitor))
 
         if self.on_notify:
             await self.on_notify(
@@ -311,6 +338,7 @@ class ExecutionEngine:
         contract=None,
         quantity: int = 1,
         proposal_id: str = None,
+        action: str = "SELL",
     ) -> None:
         """
         After reprice_wait_minutes without a fill:
@@ -355,7 +383,7 @@ class ExecutionEngine:
         )
         await db.commit()
 
-        new_order = LimitOrder("SELL", quantity, new_price)
+        new_order = LimitOrder(action, quantity, new_price)
         new_order.orderRef = new_client_id
         new_order.tif = "DAY"
 
@@ -543,6 +571,7 @@ class ExecutionEngine:
                        WHERE trade_id = ?""",
                     (datetime.now(timezone.utc).isoformat(), fill_price, reason, pnl, outcome, trade_id),
                 )
+                await db.execute("DELETE FROM positions WHERE trade_id = ?", (trade_id,))
                 await db.commit()
 
             logger.info(

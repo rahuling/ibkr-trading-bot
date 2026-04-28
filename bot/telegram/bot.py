@@ -132,10 +132,66 @@ class TelegramBot:
             logger.warning("Telegram not ready, dropping alert: %s", message)
 
     async def send_morning_summary(self) -> None:
-        """
-        9:30am ET daily morning summary.
+        """9:30am ET daily morning summary: portfolio value, open positions, expiry alerts."""
+        import json
+        from datetime import date, timedelta
 
-        PRD §5 M3 Push Notifications — Morning Summary.
-        TODO (Phase 4): compile open positions, Greeks, day's agenda.
-        """
-        raise NotImplementedError
+        from bot.database import get_db
+
+        today = date.today()
+        lines = [f"🌅 MORNING SUMMARY — {today.strftime('%b %d, %Y')}", "──────────────────────"]
+
+        # Portfolio value
+        if self.ibkr and self.ibkr.is_connected:
+            net_liq = self.ibkr.get_net_liquidation()
+            currency = self.ibkr.get_net_liquidation_currency() if net_liq else None
+            suffix = f" {currency}" if currency and currency != "USD" else ""
+            if net_liq:
+                lines.append(f"Portfolio:  ${net_liq:,.0f}{suffix}")
+
+        # Open positions + expiry sweep
+        async with get_db() as db:
+            async with db.execute(
+                "SELECT underlying, strategy, legs FROM trades WHERE status = 'open' ORDER BY underlying"
+            ) as cur:
+                rows = await cur.fetchall()
+
+        open_count = len(rows)
+        lines.append(f"Open positions: {open_count}")
+
+        # Flag anything expiring in the next 7 calendar days
+        expiring = []
+        for row in rows:
+            legs = json.loads(row["legs"]) if isinstance(row["legs"], str) else row["legs"]
+            for leg in legs:
+                exp_str = leg.get("expiry", "")
+                if not exp_str:
+                    continue
+                try:
+                    exp_date = date.fromisoformat(exp_str)
+                    dte = (exp_date - today).days
+                    if 0 <= dte <= 7:
+                        expiring.append((row["underlying"], row["strategy"], dte, leg.get("strike", 0), leg.get("right", "")))
+                except ValueError:
+                    pass
+
+        if expiring:
+            lines.append(f"\n⏰ Expiring within 7 days ({len(expiring)}):")
+            for underlying, strategy, dte, strike, right in sorted(expiring, key=lambda x: x[2]):
+                label = f"${strike:.0f}{right}" if strike else ""
+                lines.append(f"  {underlying} {strategy} {label} — {dte}d")
+
+        # Risk engine state
+        if self.risk_engine:
+            if self.risk_engine.is_paused:
+                lines.append("\n⏸ BOT IS PAUSED — use /resume to restart trading.")
+            try:
+                pdt = self.risk_engine.check_pdt()
+                if pdt.result.value != "ok":
+                    icon = "⚠️" if pdt.result.value == "warning" else "🚨"
+                    lines.append(f"\n{icon} PDT: {pdt.reason}")
+            except Exception:
+                pass
+
+        lines.append("\nGood trading day! Use /positions for live P&L.")
+        await self.send_alert("\n".join(lines))

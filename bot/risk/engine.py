@@ -325,8 +325,9 @@ class RiskEngine:
             )
 
         async with get_db() as db:
+            # M9: CoveredCall is collateralised by owned shares — exclude from cash capital calc.
             async with db.execute(
-                "SELECT legs FROM trades WHERE bucket = ? AND status = 'open'",
+                "SELECT legs FROM trades WHERE bucket = ? AND status = 'open' AND strategy != 'CoveredCall'",
                 (bucket,),
             ) as cur:
                 rows = await cur.fetchall()
@@ -380,8 +381,9 @@ class RiskEngine:
                     r = await cur.fetchone()
                 bucket_counts[bucket] = r[0] if r else 0
 
+                # M9: exclude CC — collateralised by shares, not cash capital.
                 async with db.execute(
-                    "SELECT legs FROM trades WHERE bucket = ? AND status = 'open'",
+                    "SELECT legs FROM trades WHERE bucket = ? AND status = 'open' AND strategy != 'CoveredCall'",
                     (bucket,),
                 ) as cur:
                     rows = await cur.fetchall()

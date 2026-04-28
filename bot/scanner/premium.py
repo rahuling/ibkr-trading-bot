@@ -205,8 +205,11 @@ class PremiumScanner:
         import uuid
         from datetime import datetime, timedelta, timezone
 
+        import pytz
         from bot.builder.csp import build_csp_proposal, format_csp_trade_card
         from bot.builder.spread import build_spread_proposal, format_spread_trade_card
+
+        ET = pytz.timezone("America/New_York")
 
         async with get_db() as db:
             for candidate in candidates:
@@ -230,6 +233,15 @@ class PremiumScanner:
 
                     now = datetime.now(timezone.utc)
                     expires_at = now + timedelta(minutes=self.config.execution.proposal_ttl_minutes)
+
+                    # M7: cap expires_at so proposals don't outlive the trading day.
+                    # A proposal that expires at 5pm is effectively stale from 3:55pm onward.
+                    now_et = now.astimezone(ET)
+                    blackout_mins = self.config.execution.order_blackout_close_mins
+                    close_cap_et = now_et.replace(hour=16, minute=0, second=0, microsecond=0) - timedelta(minutes=blackout_mins)
+                    close_cap_utc = close_cap_et.astimezone(timezone.utc)
+                    if expires_at > close_cap_utc > now:
+                        expires_at = close_cap_utc
 
                     await db.execute(
                         """INSERT INTO proposals
