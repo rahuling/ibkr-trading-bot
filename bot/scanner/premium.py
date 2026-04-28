@@ -184,17 +184,29 @@ class PremiumScanner:
                 logger.debug("%s: open position exists — skipping", ticker)
                 return False
 
-        # 3. Simplified bucket capacity: max 3 simultaneous positions per bucket
-        # (since max_position_pct_of_bucket = 0.33, meaning 3 fills the bucket)
-        # Full capital-aware check is implemented in Phase 4 risk engine.
+        # 2b. Already have a pending proposal for this underlying (prevents duplicate
+        #     proposals when both the 9:45am and 3pm scans fire on the same ticker).
+        async with db.execute(
+            "SELECT COUNT(*) FROM proposals WHERE underlying = ? AND status = 'pending'",
+            (ticker,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] > 0:
+                logger.debug("%s: pending proposal already exists — skipping", ticker)
+                return False
+
+        # 3. Simplified bucket capacity check: derived from max_position_pct_of_bucket.
+        # e.g. 0.33 → floor(1/0.33) = 3 slots. Full capital check happens at approval time.
+        import math as _math
+        max_slots = _math.floor(1.0 / self.config.risk.max_position_pct_of_bucket)
         async with db.execute(
             "SELECT COUNT(*) FROM trades WHERE bucket = ? AND status = 'open'",
             (bucket,),
         ) as cursor:
             row = await cursor.fetchone()
             open_count = row[0] if row else 0
-            if open_count >= 3:
-                logger.debug("%s: %s bucket at capacity (%d open) — skipping", ticker, bucket, open_count)
+            if open_count >= max_slots:
+                logger.debug("%s: %s bucket at capacity (%d/%d open) — skipping", ticker, bucket, open_count, max_slots)
                 return False
 
         return True

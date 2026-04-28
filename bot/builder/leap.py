@@ -206,11 +206,11 @@ async def build_leap_proposal(config, ibkr, candidate) -> Optional[LEAPProposal]
 
 def format_leap_trade_card(proposal: LEAPProposal, proposal_id: str) -> str:
     """Format a LEAP proposal as a Telegram trade card."""
+    near_high = "  ↑ Near day high" if proposal.pct_from_day_high <= 0.5 else ""
     return (
         f"📋 TRADE PROPOSAL #{proposal_id}\n"
         f"──────────────────────────────\n"
-        f"Underlying:  {proposal.underlying} (${proposal.underlying_price:.2f})"
-        f"  ↑ Near day high\n"
+        f"Underlying:  {proposal.underlying} (${proposal.underlying_price:.2f}){near_high}\n"
         f"Strategy:    EOD LEAP Call (Momentum)\n"
         f"LEAP:        {proposal.expiry} ${proposal.strike:.0f} Call ({proposal.dte} DTE)\n"
         f"Cost:        ${proposal.ask_price:.2f}  (${proposal.cost_total:,.0f} total)\n"

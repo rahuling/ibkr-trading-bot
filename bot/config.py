@@ -38,8 +38,6 @@ class RiskConfig(BaseModel):
     min_ivr_tactical: int = 35
     earnings_blackout_pre_days: int = 7
     earnings_blackout_post_days: int = 2
-    order_blackout_open_mins: int = 15
-    order_blackout_close_mins: int = 5
     pdt_warning_threshold: float = 30_000.0
     pdt_stop_threshold: float = 25_000.0
 

@@ -219,8 +219,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
         "/config — current configuration\n"
         "/setconfig \\[param\\] \\[value\\] — adjust parameter\n"
         "/watchlist — current watchlist\n"
-        "/addticker \\[ticker\\] — add to watchlist\n"
-        "/removeticker \\[ticker\\] — remove from watchlist\n\n"
+        "/addticker \\[ticker\\] \\[bucket\\] — add to watchlist \\(core/tactical/momentum\\)\n"
+        "/removeticker \\[ticker\\] \\[bucket\\] — remove from watchlist\n\n"
         "*System*\n"
         "/status — bot health and IB Gateway connection\n"
         "/pause — halt scanning and execution\n"
@@ -310,26 +310,26 @@ async def _scan_for_cc_proposals(update, bot) -> None:
 
     now = datetime.now(timezone.utc)
     generated = 0
-    for row in assigned_rows:
-        underlying = row["underlying"]
-        csp_credit = row["csp_credit"] or 0
-        csp_legs   = json.loads(row["csp_legs"]) if isinstance(row["csp_legs"], str) else row["csp_legs"]
-        csp_leg    = next((l for l in csp_legs if l.get("action") == "SELL"), None)
-        strike     = csp_leg.get("strike", 0) if csp_leg else 0
-        net_cost   = round(strike - csp_credit, 2)
+    async with get_db() as db:
+        for row in assigned_rows:
+            underlying = row["underlying"]
+            csp_credit = row["csp_credit"] or 0
+            csp_legs   = json.loads(row["csp_legs"]) if isinstance(row["csp_legs"], str) else row["csp_legs"]
+            csp_leg    = next((l for l in csp_legs if l.get("action") == "SELL"), None)
+            strike     = csp_leg.get("strike", 0) if csp_leg else 0
+            net_cost   = round(strike - csp_credit, 2)
 
-        try:
-            proposal = await build_cc_proposal(bot.config, bot.ibkr, underlying, net_cost)
-            if not proposal:
-                await update.message.reply_text(
-                    f"{underlying}: no CC proposal available (market data unavailable or no valid strike)."
-                )
-                continue
+            try:
+                proposal = await build_cc_proposal(bot.config, bot.ibkr, underlying, net_cost)
+                if not proposal:
+                    await update.message.reply_text(
+                        f"{underlying}: no CC proposal available (market data unavailable or no valid strike)."
+                    )
+                    continue
 
-            proposal_id = uuid.uuid4().hex[:6].upper()
-            trade_card  = format_cc_trade_card(proposal, proposal_id)
+                proposal_id = uuid.uuid4().hex[:6].upper()
+                trade_card  = format_cc_trade_card(proposal, proposal_id)
 
-            async with get_db() as db:
                 await db.execute(
                     """INSERT INTO proposals
                        (proposal_id, underlying, strategy, trade_card_json,
@@ -345,11 +345,11 @@ async def _scan_for_cc_proposals(update, bot) -> None:
                 )
                 await db.commit()
 
-            await update.message.reply_text(trade_card)
-            generated += 1
-        except Exception as exc:
-            logger.error("CC proposal generation failed for %s: %s", underlying, exc, exc_info=True)
-            await update.message.reply_text(f"{underlying}: CC proposal error — {exc}")
+                await update.message.reply_text(trade_card)
+                generated += 1
+            except Exception as exc:
+                logger.error("CC proposal generation failed for %s: %s", underlying, exc, exc_info=True)
+                await update.message.reply_text(f"{underlying}: CC proposal error — {exc}")
 
     if generated:
         await update.message.reply_text(f"✅ {generated} CC proposal(s) generated.")
@@ -920,13 +920,81 @@ async def cmd_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE, bot)
 
 
 async def cmd_addticker(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Add ticker to watchlist. TODO (Phase 2)."""
-    await update.message.reply_text("/addticker: TODO Phase 2")
+    """Add a ticker to a watchlist bucket. Usage: /addticker <TICKER> <core|tactical|momentum>"""
+    args = context.args if context.args else []
+    if len(args) != 2:
+        await update.message.reply_text("Usage: /addticker <TICKER> <core|tactical|momentum>")
+        return
+
+    ticker = args[0].upper()
+    bucket = args[1].lower()
+
+    if bucket not in ("core", "tactical", "momentum"):
+        await update.message.reply_text("Bucket must be: core, tactical, or momentum")
+        return
+
+    if bucket == "core":
+        wl = bot.config.scanner.watchlist.core
+    elif bucket == "tactical":
+        wl = bot.config.scanner.watchlist.tactical
+    else:
+        wl = bot.config.leap.momentum_watchlist
+
+    if ticker in wl:
+        await update.message.reply_text(f"{ticker} is already in the {bucket} watchlist.")
+        return
+
+    wl.append(ticker)
+
+    async with get_db() as db:
+        await db.execute(
+            """INSERT INTO config_changes (param, old_value, new_value, changed_by, changed_at)
+               VALUES (?, ?, ?, 'user', ?)""",
+            (f"watchlist.{bucket}", "", ticker, datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+
+    logger.info("Watchlist updated: added %s to %s", ticker, bucket)
+    await update.message.reply_text(f"✅ {ticker} added to {bucket} watchlist.")
 
 
 async def cmd_removeticker(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
-    """Remove ticker from watchlist. TODO (Phase 2)."""
-    await update.message.reply_text("/removeticker: TODO Phase 2")
+    """Remove a ticker from a watchlist bucket. Usage: /removeticker <TICKER> <core|tactical|momentum>"""
+    args = context.args if context.args else []
+    if len(args) != 2:
+        await update.message.reply_text("Usage: /removeticker <TICKER> <core|tactical|momentum>")
+        return
+
+    ticker = args[0].upper()
+    bucket = args[1].lower()
+
+    if bucket not in ("core", "tactical", "momentum"):
+        await update.message.reply_text("Bucket must be: core, tactical, or momentum")
+        return
+
+    if bucket == "core":
+        wl = bot.config.scanner.watchlist.core
+    elif bucket == "tactical":
+        wl = bot.config.scanner.watchlist.tactical
+    else:
+        wl = bot.config.leap.momentum_watchlist
+
+    if ticker not in wl:
+        await update.message.reply_text(f"{ticker} is not in the {bucket} watchlist.")
+        return
+
+    wl.remove(ticker)
+
+    async with get_db() as db:
+        await db.execute(
+            """INSERT INTO config_changes (param, old_value, new_value, changed_by, changed_at)
+               VALUES (?, ?, ?, 'user', ?)""",
+            (f"watchlist.{bucket}", ticker, "", datetime.now(timezone.utc).isoformat()),
+        )
+        await db.commit()
+
+    logger.info("Watchlist updated: removed %s from %s", ticker, bucket)
+    await update.message.reply_text(f"✅ {ticker} removed from {bucket} watchlist.")
 
 
 async def cmd_reconcile(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:

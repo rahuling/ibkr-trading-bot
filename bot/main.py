@@ -55,20 +55,26 @@ class HeartbeatMonitor:
     Tracks consecutive missed heartbeats and fires a Telegram alert after 2.
 
     A heartbeat is considered alive if the IB Gateway is connected.
-    Using a class instead of a module-level global avoids mutable shared state.
+    Alerts only on the transition into and out of the disconnected state,
+    not on every tick — prevents flooding while the gateway stays down.
     """
 
     def __init__(self) -> None:
         self._missed = 0
+        self._alerted = False  # True while in a disconnected alert state
 
     async def tick(self, ibkr: IBKRConnection, telegram_bot) -> None:
         if ibkr.is_connected:
-            logger.debug("Heartbeat OK")
+            if self._alerted:
+                await telegram_bot.send_alert("✅ IB Gateway reconnected — bot resuming normally.")
+                self._alerted = False
             self._missed = 0
+            logger.debug("Heartbeat OK")
         else:
             self._missed += 1
             logger.error("Heartbeat failed (%s missed) — IB Gateway not connected", self._missed)
-            if self._missed >= 2:
+            if self._missed >= 2 and not self._alerted:
+                self._alerted = True
                 await telegram_bot.send_alert(
                     "💤 Bot heartbeat missed — IB Gateway disconnected."
                 )

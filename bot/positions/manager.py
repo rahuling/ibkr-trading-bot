@@ -590,7 +590,7 @@ class PositionManager:
     # Roll logic
     # ------------------------------------------------------------------
 
-    async def build_roll_proposal(self, db, position_id: str) -> Optional[dict]:
+    async def build_roll_proposal(self, db, trade_id: str) -> Optional[dict]:
         """
         Build a CSP roll proposal for /roll [id].
 
@@ -605,7 +605,7 @@ class PositionManager:
         from datetime import date
 
         async with db.execute(
-            "SELECT * FROM trades WHERE trade_id = ? AND status = 'open'", (position_id,)
+            "SELECT * FROM trades WHERE trade_id = ? AND status = 'open'", (trade_id,)
         ) as cur:
             row = await cur.fetchone()
 
@@ -713,7 +713,7 @@ class PositionManager:
             return None
 
         return {
-            "trade_id":         position_id,
+            "trade_id":         trade_id,
             "underlying":       underlying,
             "current_strike":   cur_strike,
             "current_expiry":   cur_expiry,

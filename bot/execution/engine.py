@@ -532,10 +532,54 @@ class ExecutionEngine:
             return None
         return (bid + ask) / 2
 
-    async def _monitor_close_fill(self, ib_trade, position, reason: str) -> None:
-        """Wait for a close order to fill, then update DB and notify."""
+    async def _record_close_fill(self, position: dict, fill_price: float, reason: str) -> None:
+        """Write a completed close fill to DB and notify user."""
         from bot.database import get_db
 
+        underlying    = position.get("underlying", "?")
+        strategy      = position.get("strategy", "?")
+        trade_id      = position.get("trade_id")
+        entry_credit  = position.get("entry_credit")
+
+        if entry_credit:
+            if strategy == "LEAPCall":
+                pnl = round((fill_price - entry_credit) * 100, 2)
+            else:
+                pnl = round((entry_credit - fill_price) * 100, 2)
+        else:
+            pnl = None
+        outcome = ("Win" if pnl > 0 else ("Loss" if pnl < 0 else "BreakEven")) if pnl is not None else None
+
+        async with get_db() as db:
+            await db.execute(
+                """UPDATE trades
+                   SET status = 'closed', exit_date = ?, exit_price = ?,
+                       exit_reason = ?, pnl = ?, outcome = ?
+                   WHERE trade_id = ?""",
+                (datetime.now(timezone.utc).isoformat(), fill_price, reason, pnl, outcome, trade_id),
+            )
+            await db.execute("DELETE FROM positions WHERE trade_id = ?", (trade_id,))
+            await db.commit()
+
+        logger.info(
+            "Close fill recorded: trade=%s fill=%.2f pnl=%s reason=%s",
+            trade_id, fill_price, pnl, reason,
+        )
+        if self.on_notify:
+            pnl_str = f"  |  P&L: ${pnl:+.0f}" if pnl is not None else ""
+            await self.on_notify(
+                f"✅ CLOSED: {underlying} {strategy}\n"
+                f"Fill: ${fill_price:.2f}  |  Reason: {reason}{pnl_str}"
+            )
+
+    async def _monitor_close_fill(self, ib_trade, position, reason: str) -> None:
+        """
+        Wait for a close order to fill; reprice once if unfilled after reprice_wait_minutes.
+
+        Close order reprice direction:
+          BUY-to-close (premium-selling): raise limit by 1 tick to attract sellers.
+          SELL-to-close (LEAP): lower limit by 1 tick to attract buyers.
+        """
         wait_secs = self.config.execution.reprice_wait_minutes * 60
         elapsed = 0
         while elapsed < wait_secs:
@@ -545,54 +589,61 @@ class ExecutionEngine:
                 break
 
         underlying = position.get("underlying", "?")
-        strategy = position.get("strategy", "?")
-        trade_id = position.get("trade_id")
-        entry_credit = position.get("entry_credit")
+        strategy   = position.get("strategy", "?")
+        trade_id   = position.get("trade_id")
 
         if ib_trade.isDone() and ib_trade.orderStatus.status == "Filled":
-            fill_price = ib_trade.orderStatus.avgFillPrice
-            strategy = position.get("strategy", "")
-            if entry_credit:
-                # LEAP: bought at entry_credit, sold at fill → profit = fill - cost
-                # Premium-selling: sold at entry_credit, bought back at fill → profit = credit - fill
-                if strategy == "LEAPCall":
-                    pnl = round((fill_price - entry_credit) * 100, 2)
-                else:
-                    pnl = round((entry_credit - fill_price) * 100, 2)
-            else:
-                pnl = None
-            outcome = ("Win" if pnl > 0 else ("Loss" if pnl < 0 else "BreakEven")) if pnl is not None else None
+            await self._record_close_fill(position, ib_trade.orderStatus.avgFillPrice, reason)
+            return
 
-            async with get_db() as db:
-                await db.execute(
-                    """UPDATE trades
-                       SET status = 'closed', exit_date = ?, exit_price = ?,
-                           exit_reason = ?, pnl = ?, outcome = ?
-                       WHERE trade_id = ?""",
-                    (datetime.now(timezone.utc).isoformat(), fill_price, reason, pnl, outcome, trade_id),
-                )
-                await db.execute("DELETE FROM positions WHERE trade_id = ?", (trade_id,))
-                await db.commit()
+        # Cancel original order before reprice attempt
+        if not ib_trade.isDone():
+            self.ibkr.ib.cancelOrder(ib_trade.order)
+            for _ in range(30):
+                if ib_trade.isDone():
+                    break
+                await asyncio.sleep(1)
 
-            logger.info(
-                "Close fill recorded: trade=%s fill=%.2f pnl=%s reason=%s",
-                trade_id, fill_price, pnl, reason,
+        # N4: single reprice attempt for unfilled close orders
+        try:
+            legs     = json.loads(position["legs"]) if isinstance(position["legs"], str) else position["legs"]
+            contract = await self._reconstruct_contract(strategy, underlying, legs)
+            mid      = await self._get_current_mid(contract)
+
+            if mid is not None:
+                close_action = "SELL" if strategy == "LEAPCall" else "BUY"
+                tick     = get_tick_size(mid)
+                reprice  = round(mid + tick, 2) if close_action == "BUY" else round(mid - tick, 2)
+
+                retry_order     = LimitOrder(close_action, 1, reprice)
+                retry_order.tif = "DAY"
+                retry_trade     = self.ibkr.ib.placeOrder(contract, retry_order)
+
+                logger.info("Close reprice: %s %s %.2f → %.2f", underlying, strategy, mid, reprice)
+
+                retry_secs = self.config.execution.reprice_retry_wait_minutes * 60
+                elapsed = 0
+                while elapsed < retry_secs:
+                    await asyncio.sleep(10)
+                    elapsed += 10
+                    if retry_trade.isDone():
+                        break
+
+                if retry_trade.isDone() and retry_trade.orderStatus.status == "Filled":
+                    await self._record_close_fill(position, retry_trade.orderStatus.avgFillPrice, reason)
+                    return
+
+                if not retry_trade.isDone():
+                    self.ibkr.ib.cancelOrder(retry_trade.order)
+        except Exception as exc:
+            logger.error("Close reprice failed for %s: %s", trade_id, exc)
+
+        logger.warning("Close order unfilled after reprice for trade=%s — cancelled", trade_id)
+        if self.on_notify:
+            await self.on_notify(
+                f"⚠️ Close order unfilled after reprice for {underlying} {strategy} — cancelled.\n"
+                f"Close manually in TWS or use /close to retry."
             )
-            if self.on_notify:
-                pnl_str = f"  |  P&L: ${pnl:+.0f}" if pnl is not None else ""
-                await self.on_notify(
-                    f"✅ CLOSED: {underlying} {strategy}\n"
-                    f"Fill: ${fill_price:.2f}  |  Reason: {reason}{pnl_str}"
-                )
-        else:
-            if not ib_trade.isDone():
-                self.ibkr.ib.cancelOrder(ib_trade.order)
-            logger.warning("Close order unfilled for trade=%s — cancelled", trade_id)
-            if self.on_notify:
-                await self.on_notify(
-                    f"⚠️ Close order unfilled for {underlying} {strategy} — cancelled.\n"
-                    f"Use /close to retry or close manually in TWS."
-                )
 
     # ------------------------------------------------------------------
     # Orphan recovery (called on startup reconciliation)

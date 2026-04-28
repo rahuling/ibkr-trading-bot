@@ -159,6 +159,24 @@ class TelegramBot:
         open_count = len(rows)
         lines.append(f"Open positions: {open_count}")
 
+        # Yesterday's realized P&L
+        from datetime import timedelta, timezone as _tz
+        yesterday_start = (today - timedelta(days=1)).isoformat()
+        today_start = today.isoformat()
+        async with get_db() as pnl_db:
+            async with pnl_db.execute(
+                """SELECT COALESCE(SUM(pnl), 0), COUNT(*)
+                   FROM trades
+                   WHERE status = 'closed'
+                     AND exit_date >= ? AND exit_date < ?
+                     AND pnl IS NOT NULL""",
+                (yesterday_start, today_start),
+            ) as cur:
+                pnl_row = await cur.fetchone()
+        if pnl_row and pnl_row[1] > 0:
+            sign = "+" if pnl_row[0] >= 0 else ""
+            lines.append(f"Yesterday P&L: {sign}${pnl_row[0]:,.0f} ({pnl_row[1]} close{'s' if pnl_row[1] != 1 else ''})")
+
         # Flag anything expiring in the next 7 calendar days
         expiring = []
         for row in rows:
