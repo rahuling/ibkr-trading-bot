@@ -43,11 +43,13 @@ class IBKRConnection:
         port: int,
         client_id: int,
         on_alert=None,   # async callable(msg: str) — sends Telegram alert
+        on_reconnect=None,  # async callable() — run after a successful reconnect
     ):
         self.host = host
         self.port = port
         self.client_id = client_id
         self._on_alert = on_alert
+        self.on_reconnect = on_reconnect
         self.ib = IB()
         self._reconnect_task: Optional[asyncio.Task] = None
         # Register the disconnect handler exactly once on the IB object that
@@ -98,7 +100,16 @@ class IBKRConnection:
             try:
                 await self.connect()
                 logger.info("Reconnected to IB Gateway on attempt %s", attempt + 1)
-                # TODO (Phase 4): trigger state reconciliation after reconnect
+                # Fills, assignments and closes may have happened while we were
+                # disconnected, and market-data subscriptions do not survive the
+                # old connection — reconcile and resubscribe before carrying on.
+                if self.on_reconnect:
+                    try:
+                        await self.on_reconnect()
+                    except Exception as exc:
+                        logger.error("Post-reconnect reconciliation failed: %s", exc, exc_info=True)
+                        if self._on_alert:
+                            await self._on_alert(f"⚠️ Reconnected, but reconciliation failed: {exc}")
                 return
             except Exception as exc:
                 logger.error("Reconnect attempt %s failed: %s", attempt + 1, exc)

@@ -18,7 +18,7 @@ import json
 import logging
 import math
 import uuid
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 
 import pytz
@@ -93,6 +93,10 @@ class ExecutionEngine:
         """
         if self.is_in_blackout():
             raise RuntimeError("Order blocked — currently in blackout window")
+        # Defence in depth: opening orders never go out while the risk engine
+        # is paused, whatever path they came from. Closes use close_position().
+        if self.risk and self.risk.is_paused:
+            raise RuntimeError("Order blocked — trading is paused (use /resume)")
 
         client_order_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
@@ -182,9 +186,14 @@ class ExecutionEngine:
         filled_at = datetime.now(timezone.utc)
 
         async with db.execute(
-            "SELECT expected_price FROM orders WHERE client_order_id = ?", (client_order_id,)
+            "SELECT expected_price, status FROM orders WHERE client_order_id = ?", (client_order_id,)
         ) as cur:
             order_row = await cur.fetchone()
+        # Idempotent: the fill monitor and post-reconnect orphan recovery can both
+        # observe the same fill. Only the first one records a trade.
+        if order_row and order_row["status"] == "filled":
+            logger.info("_record_fill: order %s already recorded — skipping duplicate", client_order_id)
+            return
         expected_price = order_row["expected_price"] if order_row else fill_price
         slippage = fill_price - expected_price
 
@@ -649,7 +658,7 @@ class ExecutionEngine:
     # Orphan recovery (called on startup reconciliation)
     # ------------------------------------------------------------------
 
-    async def recover_orphaned_orders(self, db) -> None:
+    async def recover_orphaned_orders(self, db, min_age_seconds: int = 0) -> None:
         """
         On startup: recover orders that were in-flight during a crash.
 
@@ -664,8 +673,13 @@ class ExecutionEngine:
 
         PRD §13 Failure Modes — Crash Mid-Order.
         """
+        # min_age_seconds > 0 (used after a live reconnect) skips orders that
+        # may still be mid-submit in this process rather than orphaned by a crash.
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=min_age_seconds)).isoformat()
         async with db.execute(
-            "SELECT client_order_id, ibkr_order_id FROM orders WHERE status = 'pending_submit'"
+            "SELECT client_order_id, ibkr_order_id FROM orders "
+            "WHERE status = 'pending_submit' AND created_at <= ?",
+            (cutoff,),
         ) as cur:
             pending_rows = await cur.fetchall()
 

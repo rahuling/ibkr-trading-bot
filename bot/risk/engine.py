@@ -8,6 +8,15 @@ CRITICAL DESIGN RULE: All dollar limits are computed dynamically from
 live portfolio value at the time of each check. Never use hardcoded
 dollar amounts. portfolio_value is fetched from IBKR on every call.
 
+FAIL CLOSED: if portfolio value is unavailable (gateway disconnected,
+account data not yet synced), new-trade checks return BLOCKED — a circuit
+breaker that cannot see the account must not let trades through.
+
+Pause state is persisted in the bot_state table so a restart never
+silently clears a loss-limit halt; only /resume clears it.
+
+Loss windows (day/week/month) follow the US/Eastern trading calendar.
+
 PRD reference: §5 M6 Risk Engine, §10 Risk Rules.
 """
 
@@ -17,6 +26,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
+
+import pytz
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +48,32 @@ class RiskStatus:
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
+
+ET = pytz.timezone("America/New_York")
+PAUSE_STATE_KEY = "risk_paused_reason"
+
+
+def period_starts(now: Optional[datetime] = None) -> tuple[datetime, datetime, datetime]:
+    """
+    Return (day_start, week_start, month_start) for the US/Eastern calendar,
+    expressed in UTC.
+
+    trades.exit_date is stored as a UTC ISO string, so boundaries must be
+    converted to UTC before string comparison. Midnight ET is 04:00/05:00 UTC
+    depending on DST; using UTC midnight would roll the "daily" window at
+    8pm ET, mid-evening, and start the week on UTC Monday.
+    """
+    now = now or datetime.now(timezone.utc)
+    now_et = now.astimezone(ET)
+
+    def et_midnight(d) -> datetime:
+        return ET.localize(datetime(d.year, d.month, d.day)).astimezone(timezone.utc)
+
+    today = now_et.date()
+    day_start = et_midnight(today)
+    week_start = et_midnight(today - timedelta(days=today.weekday()))
+    month_start = et_midnight(today.replace(day=1))
+    return day_start, week_start, month_start
 
 async def _sum_pnl_since(db, since: datetime) -> float:
     """Sum realized P&L from trades closed on or after `since`."""
@@ -83,23 +120,52 @@ class RiskEngine:
         self.config = config
         self.ibkr = ibkr
         self._paused = False
+        self._pause_reason: Optional[str] = None
         self.on_notify = None  # set by TelegramBot.wire()
 
     # ------------------------------------------------------------------
     # Pause / resume (set by circuit breakers or user /pause command)
+    # Persisted so a restart can't silently clear a halt.
     # ------------------------------------------------------------------
 
-    def pause(self, reason: str) -> None:
-        self._paused = True
-        logger.warning("Risk Engine PAUSED: %s", reason)
+    async def load_state(self) -> Optional[str]:
+        """Restore persisted pause state at startup. Returns the pause reason if paused."""
+        from bot.database import get_state
 
-    def resume(self) -> None:
+        reason = await get_state(PAUSE_STATE_KEY)
+        if reason:
+            self._paused = True
+            self._pause_reason = reason
+            logger.warning("Risk Engine restored in PAUSED state: %s", reason)
+        return reason
+
+    async def pause(self, reason: str) -> None:
+        from bot.database import set_state
+
+        self._paused = True
+        self._pause_reason = reason
+        logger.warning("Risk Engine PAUSED: %s", reason)
+        try:
+            await set_state(PAUSE_STATE_KEY, reason)
+        except Exception as exc:
+            # Still paused in memory; surface the persistence failure loudly.
+            logger.error("Failed to persist pause state: %s", exc)
+
+    async def resume(self) -> None:
+        from bot.database import set_state
+
         self._paused = False
+        self._pause_reason = None
         logger.info("Risk Engine RESUMED")
+        await set_state(PAUSE_STATE_KEY, None)
 
     @property
     def is_paused(self) -> bool:
         return self._paused
+
+    @property
+    def pause_reason(self) -> Optional[str]:
+        return self._pause_reason
 
     # ------------------------------------------------------------------
     # Dynamic limit computation
@@ -110,8 +176,9 @@ class RiskEngine:
         Fetch live Net Liquidation Value from IBKR.
         This is the base for all percentage-based limits.
         """
-        value = self.ibkr.get_net_liquidation()
-        if value is None:
+        value = self.ibkr.get_net_liquidation() if self.ibkr else None
+        # IBKR reports 0 / nothing until account data has synced after (re)connect.
+        if value is None or value <= 0:
             raise RuntimeError("Cannot compute risk limits — portfolio value unavailable from IBKR")
         return value
 
@@ -157,7 +224,14 @@ class RiskEngine:
           5. Capital available in bucket
         """
         if self._paused:
-            return RiskStatus(RiskCheckResult.BLOCKED, "System is paused — use /resume")
+            reason = f" ({self._pause_reason})" if self._pause_reason else ""
+            return RiskStatus(RiskCheckResult.BLOCKED, f"System is paused{reason} — use /resume")
+
+        # Fail closed: without live portfolio value no limit can be evaluated.
+        try:
+            self.get_portfolio_value()
+        except RuntimeError as exc:
+            return RiskStatus(RiskCheckResult.BLOCKED, f"{exc} — failing closed")
 
         pdt = self.check_pdt()
         if pdt.result == RiskCheckResult.BLOCKED:
@@ -192,7 +266,7 @@ class RiskEngine:
         try:
             pv = self.get_portfolio_value()
         except RuntimeError as exc:
-            return RiskStatus(RiskCheckResult.WARNING, str(exc))
+            return RiskStatus(RiskCheckResult.BLOCKED, str(exc))
 
         max_exposure = pv * self.config.risk.max_underlying_pct
 
@@ -227,17 +301,14 @@ class RiskEngine:
         try:
             pv = self.get_portfolio_value()
         except RuntimeError as exc:
-            return RiskStatus(RiskCheckResult.WARNING, str(exc))
+            return RiskStatus(RiskCheckResult.BLOCKED, str(exc))
 
         r = self.config.risk
         daily_limit   = pv * r.daily_loss_limit_pct
         weekly_limit  = pv * r.weekly_loss_limit_pct
         monthly_limit = pv * r.monthly_loss_limit_pct
 
-        now = datetime.now(timezone.utc)
-        day_start   = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_start  = day_start - timedelta(days=now.weekday())
-        month_start = day_start.replace(day=1)
+        day_start, week_start, month_start = period_starts()
 
         async with get_db() as db:
             daily_realized   = await _sum_pnl_since(db, day_start)
@@ -253,23 +324,20 @@ class RiskEngine:
         # Unrealized P&L applies to the daily check only (intraday exposure)
         daily_total = daily_realized + unrealized
 
-        def _check(label, total, limit, pause_reason):
+        for label, total, limit in [
+            ("Daily",   daily_total,      daily_limit),
+            ("Weekly",  weekly_realized,  weekly_limit),
+            ("Monthly", monthly_realized, monthly_limit),
+        ]:
             if total <= -abs(limit):
-                self.pause(pause_reason)
-                return RiskStatus(
+                result = RiskStatus(
                     RiskCheckResult.BLOCKED,
                     f"{label} loss limit hit: ${total:,.0f} loss > ${limit:,.0f} limit",
                     portfolio_value=pv,
                 )
-            return None
-
-        for result in [
-            _check("Daily",   daily_total,      daily_limit,   "Daily loss limit breached"),
-            _check("Weekly",  weekly_realized,  weekly_limit,  "Weekly loss limit breached"),
-            _check("Monthly", monthly_realized, monthly_limit, "Monthly loss limit breached"),
-        ]:
-            if result:
-                if self.on_notify:
+                already_paused = self._paused
+                await self.pause(f"{label} loss limit breached")
+                if self.on_notify and not already_paused:
                     await self.on_notify(
                         f"🚨 {result.reason}\nNew trades paused. Use /resume after review."
                     )
@@ -287,7 +355,7 @@ class RiskEngine:
         try:
             pv = self.get_portfolio_value()
         except RuntimeError as exc:
-            return RiskStatus(RiskCheckResult.WARNING, str(exc))
+            return RiskStatus(RiskCheckResult.BLOCKED, str(exc))
 
         if pv < self.config.risk.pdt_stop_threshold:
             return RiskStatus(
@@ -315,7 +383,7 @@ class RiskEngine:
             budget = self.get_bucket_budget(bucket)
             per_pos_cap = self.get_per_position_cap(bucket)
         except RuntimeError as exc:
-            return RiskStatus(RiskCheckResult.WARNING, str(exc))
+            return RiskStatus(RiskCheckResult.BLOCKED, str(exc))
 
         if capital_required > per_pos_cap:
             return RiskStatus(
@@ -355,10 +423,7 @@ class RiskEngine:
         except RuntimeError:
             pv = None
 
-        now = datetime.now(timezone.utc)
-        day_start   = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_start  = day_start - timedelta(days=now.weekday())
-        month_start = day_start.replace(day=1)
+        day_start, week_start, month_start = period_starts()
 
         async with get_db() as db:
             daily_realized   = await _sum_pnl_since(db, day_start)
@@ -423,7 +488,7 @@ class RiskEngine:
             "📊 RISK DASHBOARD",
             "──────────────────────",
             f"Portfolio:  {pv_str}",
-            f"Paused:     {'Yes ⏸' if s['paused'] else 'No'}",
+            f"Paused:     {('Yes ⏸ — ' + (self._pause_reason or 'manual')) if s['paused'] else 'No'}",
             "",
             "Capital Allocation",
         ]

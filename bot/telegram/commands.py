@@ -739,7 +739,7 @@ async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> N
 async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Halt scanning and execution."""
     if bot.risk_engine:
-        bot.risk_engine.pause("User command /pause")
+        await bot.risk_engine.pause("User command /pause")
         await update.message.reply_text("⏸ Bot paused. Use /resume to restart.")
     else:
         await update.message.reply_text("Risk engine not ready.")
@@ -748,7 +748,7 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE, bot) -> None:
     """Resume after pause."""
     if bot.risk_engine:
-        bot.risk_engine.resume()
+        await bot.risk_engine.resume()
         await update.message.reply_text("▶️ Bot resumed.")
     else:
         await update.message.reply_text("Risk engine not ready.")
