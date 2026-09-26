@@ -207,6 +207,7 @@ async def reconcile_state(
     ibkr: IBKRConnection,
     telegram_bot,
     execution_engine=None,
+    min_order_age_seconds: int = 0,
 ) -> bool:
     """
     Compare DB open positions against live IBKR positions.
@@ -222,7 +223,7 @@ async def reconcile_state(
     # 1. Recover orphaned orders (crash-mid-order recovery)
     if execution_engine:
         async with get_db() as db:
-            await execution_engine.recover_orphaned_orders(db)
+            await execution_engine.recover_orphaned_orders(db, min_age_seconds=min_order_age_seconds)
 
     # 2. Compare DB open trades vs IBKR live option positions
     async with get_db() as db:
@@ -328,6 +329,12 @@ async def main() -> None:
     from bot.execution.engine import ExecutionEngine
 
     risk_engine = RiskEngine(config, ibkr)
+    paused_reason = await risk_engine.load_state()
+    if paused_reason:
+        await telegram_bot.send_alert(
+            f"⏸ Bot restarted in PAUSED state: {paused_reason}\n"
+            "No new trades until /resume."
+        )
     position_manager = PositionManager(config, ibkr, risk_engine)
     execution_engine = ExecutionEngine(config, ibkr, risk_engine)
 
@@ -348,6 +355,13 @@ async def main() -> None:
     # 8b. Subscribe to real-time price ticks and wire assignment detection
     await position_manager.subscribe_all_open_positions()
     position_manager.setup_assignment_detection()
+
+    # 8c. After any gateway reconnect: recover orphaned orders, compare DB vs
+    #     IBKR positions, and re-establish tick subscriptions.
+    async def _after_reconnect() -> None:
+        await reconcile_state(ibkr, telegram_bot, execution_engine, min_order_age_seconds=120)
+        await position_manager.resubscribe_all_open_positions()
+    ibkr.on_reconnect = _after_reconnect
 
     # 9. Start scheduler (scanner references wired to bot inside build_scheduler)
     heartbeat_monitor = HeartbeatMonitor()

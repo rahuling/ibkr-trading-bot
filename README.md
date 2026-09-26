@@ -109,6 +109,17 @@ All limits are computed from **live portfolio value** fetched from IBKR on every
 | Order blackout (open) | 9:30–9:45am ET | Block order submission |
 | Order blackout (close) | 3:55–4:00pm ET | Block order submission |
 
+**Safety behaviour**
+
+- **Fails closed.** If live portfolio value can't be read from IBKR (gateway down, account data
+  not yet synced, or a zero value), every new-trade check returns *blocked*. It does not fall
+  through with a warning.
+- **Pauses survive restarts.** A loss-limit breach or `/pause` is stored in the `bot_state` table.
+  After a restart the bot comes back paused and says so on Telegram. Only `/resume` clears it.
+- **Loss windows follow the US/Eastern calendar.** Daily, weekly (Monday) and monthly limits roll
+  at midnight ET, DST-aware, not UTC.
+- **Opening orders are refused while paused** inside the execution engine too, not only at `/approve`.
+
 ---
 
 ## Execution rules
@@ -117,6 +128,7 @@ All limits are computed from **live portfolio value** fetched from IBKR on every
 - **Spreads are submitted as BAG/combo contracts** (never two individual legs).
 - **Idempotent crash recovery**: `client_order_id` (UUID) is written to the `orders` table *before* the order is sent to IBKR. On startup, the bot checks `pending_submit` orders (crash before/during submit) against live IBKR open orders, and `submitted` orders (crash after submit but before fill was recorded) against IBKR execution reports — ensuring no fill is ever lost across a restart.
 - **Open order repricing**: if an order is unfilled after 5 minutes, reprice 1 tick lower (accept less credit) and resubmit once. If still unfilled after 3 more minutes, cancel and notify.
+- **Reconnect recovery**: after an IB Gateway reconnect the bot re-runs orphaned-order recovery and the DB-vs-IBKR position check, then re-subscribes price ticks for open positions. Fill recording is idempotent, so a fill seen by both the fill monitor and recovery is recorded once.
 - **Close order repricing**: if a close order is unfilled after 5 minutes, reprice 1 tick toward fill (raise limit for BUY-to-close, lower for SELL-to-close LEAP) and resubmit once. If still unfilled, cancel and alert.
 - **Tick size**: $0.05 for options < $3.00, $0.10 for options ≥ $3.00.
 - **Proposal TTL**: configurable (default 2 hours), hard capped at the close blackout window (3:55pm ET) so proposals never linger in "pending" state after market close.
@@ -352,3 +364,16 @@ All phases complete. Full bug sweep done. Ready for paper trading.
 - IB Gateway port 4002 is bound to `127.0.0.1` only in `docker-compose.yml` — do not change this.
 - The Telegram bot validates `TELEGRAM_ALLOWED_USER_IDS` on every command — only whitelisted user IDs can interact with the bot.
 - On a VPS, run behind a firewall with no inbound access to port 4002.
+
+---
+
+## Tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q
+```
+
+The tests cover the risk engine (fail-closed checks, limits, persisted pause, ET loss windows)
+and execution guards (pause gate, idempotent fills, reconnect-safe orphan recovery). CI runs them
+on every push and PR (`.github/workflows/ci.yml`).

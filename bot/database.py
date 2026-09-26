@@ -12,6 +12,7 @@ import aiosqlite
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -153,19 +154,27 @@ CREATE TABLE IF NOT EXISTS config_changes (
     changed_by  TEXT NOT NULL,   -- 'user' or 'system'
     changed_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Durable bot flags that must survive a restart (e.g. risk engine pause).
+CREATE TABLE IF NOT EXISTS bot_state (
+    key         TEXT PRIMARY KEY,
+    value       TEXT,
+    updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
 """
 
 # ---------------------------------------------------------------------------
 # Initialisation
 # ---------------------------------------------------------------------------
 
-async def init_db(db_path: Path = DB_PATH) -> None:
+async def init_db(db_path: Optional[Path] = None) -> None:
     """
     Create database file, enable WAL mode, and run schema migrations.
 
     Safe to call on every startup — all CREATE TABLE statements use
     IF NOT EXISTS. Schema changes must be additive only.
     """
+    db_path = db_path or DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     async with aiosqlite.connect(db_path) as db:
@@ -176,15 +185,42 @@ async def init_db(db_path: Path = DB_PATH) -> None:
 
 
 @asynccontextmanager
-async def get_db(db_path: Path = DB_PATH):
+async def get_db(db_path: Optional[Path] = None):
     """
     Async context manager for a database connection with WAL mode and foreign keys.
 
         async with get_db() as db:
             ...
     """
-    async with aiosqlite.connect(db_path) as conn:
+    # Resolve DB_PATH at call time (not definition time) so tests can redirect it.
+    async with aiosqlite.connect(db_path or DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         await conn.execute("PRAGMA journal_mode = WAL")
         await conn.execute("PRAGMA foreign_keys = ON")
         yield conn
+
+
+# ---------------------------------------------------------------------------
+# Durable key/value state
+# ---------------------------------------------------------------------------
+
+async def get_state(key: str) -> Optional[str]:
+    """Return a persisted bot_state value, or None if unset."""
+    async with get_db() as db:
+        async with db.execute("SELECT value FROM bot_state WHERE key = ?", (key,)) as cur:
+            row = await cur.fetchone()
+    return row["value"] if row else None
+
+
+async def set_state(key: str, value: Optional[str]) -> None:
+    """Upsert a bot_state value (None deletes the key)."""
+    async with get_db() as db:
+        if value is None:
+            await db.execute("DELETE FROM bot_state WHERE key = ?", (key,))
+        else:
+            await db.execute(
+                """INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP""",
+                (key, value),
+            )
+        await db.commit()

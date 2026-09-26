@@ -67,6 +67,19 @@ class PositionManager:
             if position["underlying"] not in self._subscriptions:
                 await self.subscribe_position(position)
 
+    async def resubscribe_all_open_positions(self) -> None:
+        """
+        After an IB Gateway reconnect: drop tick subscriptions tied to the old
+        connection and subscribe again for every open position.
+        """
+        for underlying, (ticker, _contract, handler) in list(self._subscriptions.items()):
+            try:
+                ticker.updateEvent -= handler
+            except Exception:
+                pass
+        self._subscriptions.clear()
+        await self.subscribe_all_open_positions()
+
     def setup_assignment_detection(self) -> None:
         """
         Subscribe to IBKR positionEvent to detect option assignments.
